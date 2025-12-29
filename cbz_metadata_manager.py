@@ -1,14 +1,15 @@
-#To Run - pip install requests and then python cbz_metadata_manager.py 
-#To Run via UV - pip install uv and then uv run cbz_metadata_manager.py
+#To Run via UV - pip install uv and then uv run --with tkinterdnd2 cbz_metadata_manager.py
 
 # Requires-Python: >=3.8
 # Requires-Dist: requests
+# Requires-Dist: tkinterdnd2
 
 import os
 import zipfile
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import tkinterdnd2 as tkdnd
 import json
 import requests
 import logging
@@ -25,8 +26,56 @@ import unicodedata
 from collections import defaultdict
 import time
 from functools import wraps
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Thread, Lock
+
+
+# External source URL patterns
+SOURCE_URL_PATTERNS = {
+    "manga_updates": "https://www.mangaupdates.com/series/",
+    "my_anime_list": "https://myanimelist.net/manga/",
+    "anilist": "https://anilist.co/manga/",
+    "anime_planet": "https://www.anime-planet.com/manga/",
+    "kitsu": "https://kitsu.app/manga/",
+    "shikimori": "https://shikimori.one/mangas/",
+    "anime_news_network": "https://www.animenewsnetwork.com/encyclopedia/manga.php?id="
+}
+
+# Pre-compiled patterns
+VOLUME_PATTERN = re.compile(r'v(?:ol)?\.?\s*(\d+)', re.IGNORECASE)
+CHAPTER_PATTERN = re.compile(r'\bc(?:h(?:ap(?:ter)?)?)?\.?\s*(\d+)', re.IGNORECASE)
+HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
+WHITESPACE_PATTERN = re.compile(r'\s+')
+NEWLINE_CLEANUP_PATTERN = re.compile(r'\n\s*\n\s*\n+')
+YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
+BRACKET_CONTENT_PATTERN = re.compile(r'\[([^\]]+)\]')
+PAREN_CONTENT_PATTERN = re.compile(r'\(([^)]+)\)')
+SPECIAL_CHARS_PATTERN = re.compile(r'[^a-zA-Z0-9\s]')
+ANILIST_ID_PATTERN = re.compile(r'anilist\.co/manga/(\d+)', re.IGNORECASE)
+REVERSED_VOLUME_PATTERN = re.compile(r'(\d+)(?:st|nd|rd|th)?\s*(?:vol|volume)', re.IGNORECASE)
+VOLUME_START_PATTERN = re.compile(r'^(?:volume|vol)\.?\s*(\d+)', re.IGNORECASE)
+STANDALONE_V_PATTERN = re.compile(r'\bv\.?\s*0*(\d+)\b', re.IGNORECASE)
+SEPARATOR_PATTERN = re.compile(r'[_\-]+')
+EXTENSION_PATTERN = re.compile(r'\.(cbz|cbr|zip|rar|pdf)$', re.IGNORECASE)
+
+
+_API_SESSION = None
+_SESSION_LOCK = Lock()
+
+def get_api_session():
+    """Get or create shared requests session for connection pooling"""
+    global _API_SESSION
+    if _API_SESSION is None:
+        with _SESSION_LOCK:
+            if _API_SESSION is None:
+                _API_SESSION = requests.Session()
+                _API_SESSION.headers.update({
+                    'User-Agent': 'CBZ-Metadata-Manager/4.0',
+                    'Accept': 'application/json'
+                })
+    return _API_SESSION
+
 
 # Setup logging
 logging.basicConfig(filename='cbz_metadata.log', level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
@@ -72,6 +121,22 @@ def init_database():
     conn.commit()
     conn.close()
 
+def is_valid_source_id(source_id, source_name):
+    """Validate source IDs before constructing URLs"""
+    if source_id is None or str(source_id).strip() in ['', 'null', 'None', '0']:
+        return False
+    
+    # Numeric IDs for most sources
+    if source_name in ['my_anime_list', 'anilist', 'kitsu', 'shikimori', 'anime_news_network']:
+        return str(source_id).strip('"').replace('-', '').replace('_', '').isalnum()
+    
+    # Anime-planet, Mangaupdates uses slugs
+    if source_name in ['manga_updates', 'anime_planet']:
+        return bool(re.match(r'^[a-zA-Z0-9-]+$', str(source_id).strip('"')))
+    
+    return True
+
+
 def center_window(window, width=None, height=None):
     """Center a window on the screen"""
     # Force the window to update its geometry
@@ -105,7 +170,6 @@ def center_window(window, width=None, height=None):
     y = max(0, y)
     
     window.geometry(f"{window_width}x{window_height}+{x}+{y}")
-
 
 class ToolTip:
     """Create a tooltip for a given widget"""
@@ -155,12 +219,27 @@ class ToolTip:
         if tw:
             tw.destroy()
             
+
 class SeriesDatabase:
     """Class to handle series metadata database operations"""
     
     def __init__(self, db_path="series.db"):
         self.db_path = db_path
         self.init_database()
+    
+    def _normalize_series_name(self, series_name):
+        """Remove decimal numbers from series name (e.g., '2.5' but keep '7th', 'Lv. 9999')"""
+        if not series_name:
+            return series_name
+        
+        # Remove standalone decimal numbers (e.g., 2.5, 3.14)
+        # This pattern matches: word boundary + digits + decimal point + digits + word boundary
+        normalized = re.sub(r'\b\d+\.\d+\b\s*', '', series_name)
+        
+        # Clean up any extra spaces that may result
+        normalized = WHITESPACE_PATTERN.sub( ' ', normalized).strip()
+        
+        return normalized
     
     def init_database(self):
         """Initialize the database with required tables"""
@@ -199,7 +278,12 @@ class SeriesDatabase:
         if not series_name or not series_name.strip():
             raise ValueError("Series name cannot be empty")
         
-        series_name = series_name.strip()
+        # Normalize the series name to remove decimal numbers
+        series_name = self._normalize_series_name(series_name.strip())
+        
+        if not series_name:
+            raise ValueError("Series name cannot be empty after normalization")
+        
         metadata_json = json.dumps(metadata, ensure_ascii=False, indent=2)
         
         conn = sqlite3.connect(self.db_path)
@@ -355,7 +439,7 @@ class SeriesDatabase:
         """Get all series with their aliases for matching"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-    
+
         try:
             cursor.execute('''
                 SELECT sm.series_name, sm.updated_at, 
@@ -365,23 +449,22 @@ class SeriesDatabase:
                 GROUP BY sm.series_name, sm.updated_at
                 ORDER BY sm.updated_at DESC
             ''')
-    
+
             results = []
             for row in cursor.fetchall():
                 series_name = row[0]
                 updated_at = row[1]
                 aliases = row[2].split('|') if row[2] else []
                 results.append((series_name, updated_at, aliases))
-    
+
             return results
-    
+
         except Exception as e:
             logging.error(f"Error getting series with aliases: {e}")
             return []
-    
+
         finally:
             conn.close()
-
 
 
 # ==============================================================================
@@ -462,7 +545,6 @@ class AliasEditorDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
-
 # Initialize database
 series_db = SeriesDatabase()
 
@@ -502,7 +584,7 @@ def get_metadata_from_direct_url(url):
             return []
 
         # Call Mangabaka entry endpoint
-        response = requests.get(
+        response = get_api_session().get(
             f"https://mangabaka.dev/api/entry?id={entry_id}",
             timeout=10,
             headers={'User-Agent': 'CBZ-Metadata-Tool/1.0'}
@@ -525,6 +607,7 @@ def save_api_cache():
     except Exception as e:
         logging.error(f"Failed to save API cache: {e}")
 
+@lru_cache(maxsize=1000) 
 def normalize_romaji_cached(text, cache={}):
     """Normalize romaji with caching for performance - IMPROVED VERSION"""
     if not text or text in cache:
@@ -535,10 +618,10 @@ def normalize_romaji_cached(text, cache={}):
     
     # Handle macrons - more comprehensive mapping
     macron_map = {
-        'ā': 'aa', 'ī': 'ii', 'ū': 'uu', 'ē': 'ee', 'ō': 'ou',
-        'â': 'aa', 'ê': 'ee', 'î': 'ii', 'ô': 'ou', 'û': 'uu',
-        'à': 'a', 'è': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',
-        'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+        'Ã„Â': 'aa', 'Ã„Â«': 'ii', 'Ã…Â«': 'uu', 'Ã„â€œ': 'ee', 'Ã…Â': 'ou',
+        'ÃƒÂ¢': 'aa', 'ÃƒÂª': 'ee', 'ÃƒÂ®': 'ii', 'ÃƒÂ´': 'ou', 'ÃƒÂ»': 'uu',
+        'Ãƒ ': 'a', 'ÃƒÂ¨': 'e', 'ÃƒÂ¬': 'i', 'ÃƒÂ²': 'o', 'ÃƒÂ¹': 'u',
+        'ÃƒÂ¡': 'a', 'ÃƒÂ©': 'e', 'ÃƒÂ­': 'i', 'ÃƒÂ³': 'o', 'ÃƒÂº': 'u',
     }
     for k, v in macron_map.items():
         text = text.replace(k, v)
@@ -549,7 +632,7 @@ def normalize_romaji_cached(text, cache={}):
     
     # LESS aggressive cleanup - preserve more characters that might be important
     # Replace various dashes with spaces but keep other punctuation for now
-    text = text.replace("–", " ").replace("—", " ").replace("-", " ")
+    text = text.replace("Ã¢â‚¬â€œ", " ").replace("Ã¢â‚¬â€", " ").replace("-", " ")
     
     # Remove only clearly problematic symbols, keep more punctuation
     text = re.sub(r"[^\w\s'.!?:;]", "", text)
@@ -795,6 +878,7 @@ def get_cached_merge_map():
     
     return _merge_map_cache
 
+@lru_cache(maxsize=1000)
 def find_best_match_cached_merge_aware(title):
     """IMPROVED: Version that uses cached merge map for better performance"""
     if not local_dump:
@@ -1141,7 +1225,7 @@ def get_metadata_from_dump_or_api(title, local_only=False):
         api_url = f"https://mangabaka.dev/api/search?query={encoded_title}"
         logging.info(f"Making API request to: {api_url}")
         
-        response = requests.get(
+        response = get_api_session().get(
             api_url,
             timeout=10,
             headers={'User-Agent': 'CBZ-Metadata-Tool/1.0'}
@@ -1254,48 +1338,61 @@ def create_comicinfo_xml(metadata):
     return f'<?xml version="1.0" encoding="utf-8"?>\n{xml_str}'
 
 def insert_comicinfo_into_cbz(cbz_path, xml_data):
+    """Insert ComicInfo.xml into CBZ with proper resource management"""
+    temp_path = cbz_path + '.tmp'
     try:
-        # Create a temporary file to avoid corruption
-        temp_path = cbz_path + ".tmp"
-        
         with zipfile.ZipFile(cbz_path, 'r') as original:
             with zipfile.ZipFile(temp_path, 'w', compression=zipfile.ZIP_DEFLATED) as new_zip:
-                # Copy all files except existing ComicInfo.xml
                 for item in original.infolist():
                     if item.filename != "ComicInfo.xml":
                         data = original.read(item.filename)
                         new_zip.writestr(item, data)
-                
-                # Add new ComicInfo.xml
                 new_zip.writestr("ComicInfo.xml", xml_data.encode('utf-8'))
         
-        # Replace original with updated version
         os.replace(temp_path, cbz_path)
-        logging.info(f"Successfully inserted metadata into: {cbz_path}")
-        
+        logging.info(f"Successfully inserted metadata into {cbz_path}")
     except Exception as e:
         logging.error(f"Failed to insert metadata into {cbz_path}: {e}")
-        # Clean up temp file if it exists
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-            except:
+            except OSError:  # Changed from bare except
                 pass
         raise
 
+
 def extract_volume_from_filename(filename):
-    """Extract volume number from filename"""
-    patterns = [
-        r'[Vv]ol\.?\s*(\d+)',
-        r'[Vv]olume\s*(\d+)',
-        r'\bv\.?\s*0*(\d+)\b',
-    ]
+    """Extract volume number from filename using pre-compiled patterns"""
+    # Try main volume pattern first (fastest)
+    match = VOLUME_PATTERN.search(filename)
+    if match:
+        return match.group(1)
     
-    for pattern in patterns:
-        match = re.search(pattern, filename)
-        if match:
-            return match.group(1)
+    # Try volume at start
+    match = VOLUME_START_PATTERN.search(filename)
+    if match:
+        return match.group(1)
     
+    # Try standalone v pattern
+    match = STANDALONE_V_PATTERN.search(filename)
+    if match:
+        return match.group(1)
+    
+    # Try reversed format
+    match = REVERSED_VOLUME_PATTERN.search(filename)
+    if match:
+        return match.group(1)
+    
+    return None
+
+
+
+def extract_chapter_from_filename(filename):
+    """Extract chapter number from filename using CHAPTER_PATTERN"""
+    # Use the pre-compiled CHAPTER_PATTERN
+    match = CHAPTER_PATTERN.search(filename)
+    if match:
+        return match.group(1)
     return None
 
 def extract_anilist_id_from_url(url):
@@ -1360,8 +1457,6 @@ def extract_anilist_id_from_url(url):
         logging.error(f"Error extracting AniList ID from URL '{url[:200]}...': {e}")
         raise  # Re-raise the exception so calling code can handle it with specific error messages
 
-
-
 def rate_limit(max_calls_per_minute=60):
     """Decorator to limit API calls per minute"""
     min_interval = 60.0 / max_calls_per_minute
@@ -1386,7 +1481,7 @@ def make_anilist_request(query, variables, max_retries=3):
     """Make a rate-limited request to AniList API with retry logic"""
     for attempt in range(max_retries):
         try:
-            response = requests.post(
+            response = get_api_session().post(
                 'https://graphql.anilist.co',
                 json={'query': query, 'variables': variables},
                 timeout=15,  # Increased timeout
@@ -1790,21 +1885,28 @@ def count_pages_in_cbz(path):
         return 0
 
 def auto_extract_title(filename):
-    name = os.path.splitext(os.path.basename(filename))[0]
+    """Extract and clean title from filename using optimized regex"""
+    # Remove extension
+    name = EXTENSION_PATTERN.sub('', os.path.basename(filename))
     
-    # Remove common brackets and their contents
-    name = re.sub(r'[\[\(].*?[\]\)]', '', name)
+    # Remove brackets and parentheses content
+    name = BRACKET_CONTENT_PATTERN.sub('', name)
+    name = PAREN_CONTENT_PATTERN.sub('', name)
     
-    # Remove volume/chapter information
-    name = re.sub(r'(v|vol|volume|ch|chapter)[\s_]*\d+', '', name, flags=re.I)
+    # Remove volume/chapter markers
+    name = VOLUME_PATTERN.sub('', name)
+    name = CHAPTER_PATTERN.sub('', name)
     
-    # Remove common separators and clean up
-    name = re.sub(r'[_\-]+', ' ', name)
-    name = re.sub(r'\s+', ' ', name)  # Multiple spaces to single space
+    # Replace separators with spaces
+    name = SEPARATOR_PATTERN.sub(' ', name)
+    
+    # Normalize whitespace
+    name = WHITESPACE_PATTERN.sub(' ', name)
     
     cleaned = name.strip().title()
     logging.info(f"Auto-extracted title from filename '{filename}': '{cleaned}'")
     return cleaned
+
 
 class SeriesManagerDialog(tk.Toplevel):
     """Dialog for managing saved series metadata"""
@@ -1827,7 +1929,6 @@ class SeriesManagerDialog(tk.Toplevel):
         self.update_idletasks()
         center_window(self, 900, 600)
 
-        
     def create_widgets(self):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill='both', expand=True)
@@ -1921,13 +2022,13 @@ class SeriesManagerDialog(tk.Toplevel):
         # Clear existing items
         for item in self.tree.get_children():
             self.tree.delete(item)
-    
+
         for series_data in series_list:
             try:
                 if len(series_data) == 3:
                     # Database returns: (series_name, updated_at, aliases)
                     series_name, updated_at, aliases = series_data
-    
+
                     # Format the date safely
                     try:
                         if updated_at:
@@ -1938,7 +2039,7 @@ class SeriesManagerDialog(tk.Toplevel):
                     except Exception as date_error:
                         print(f"Date formatting error for {series_name}: {date_error}")
                         formatted_date = str(updated_at) if updated_at else ""
-    
+
                     # Join aliases safely - FIXED: Handle string and list cases
                     if aliases:
                         if isinstance(aliases, list):
@@ -1952,17 +2053,17 @@ class SeriesManagerDialog(tk.Toplevel):
                             aliases_text = str(aliases)
                     else:
                         aliases_text = ""
-    
+
                     # Insert in CORRECT order: Series Name, Aliases, Last Updated
                     self.tree.insert('', 'end', values=(series_name, aliases_text, formatted_date))
-    
+
                 elif len(series_data) == 2:
                     # Fallback for old format without aliases
                     series_name, updated_at = series_data
                     try:
                         dt = datetime.fromisoformat(updated_at)
                         formatted_date = dt.strftime('%Y-%m-%d %H:%M')
-                    except:
+                    except (ValueError, AttributeError):
                         formatted_date = str(updated_at)
                     
                     self.tree.insert('', 'end', values=(series_name, "", formatted_date))
@@ -1970,7 +2071,7 @@ class SeriesManagerDialog(tk.Toplevel):
                     # Fallback for unexpected structure
                     series_name = series_data[0] if len(series_data) > 0 else "Unknown"
                     self.tree.insert('', 'end', values=(series_name, "Error", "Error"))
-    
+
             except Exception as e:
                 print(f"Error processing series data {series_data}: {e}")
                 safe_name = str(series_data[0]) if len(series_data) > 0 else "Error"
@@ -2078,12 +2179,15 @@ class SeriesManagerDialog(tk.Toplevel):
             else:
                 messagebox.showerror("Error", f"Failed to delete '{series_name}'")
 
-class MetadataGUI(tk.Tk):
+class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
     def __init__(self):
         super().__init__()
         self.title("CBZ Metadata Manager")
         self.geometry("1600x1000")
         self.minsize(1200, 800)
+        self._progress_lock = Lock()
+        self._metadata_lock = Lock()
+        self._cbz_paths_lock = Lock()  # Lock for thread-safe cbz_paths access  # NEW: Protect file_metadata dictionary
         
         self.local_only_mode = tk.BooleanVar(value=False)
         self.metadata_mode = tk.StringVar(value="batch")  # "batch" or "individual"
@@ -2098,7 +2202,7 @@ class MetadataGUI(tk.Tk):
         self.original_metadata = {}
         self.current_index = 0  
         self.metadata_options = []
-        
+             
         self.fields = [
             "Title", "Series", "LocalizedSeries", "AgeRating", "Number", "Count", "Volume", 
             "PageCount", "Summary", "Year", "Month", "Day", "Writer", "Penciller", "Inker", 
@@ -2108,7 +2212,7 @@ class MetadataGUI(tk.Tk):
             "Teams", "Locations", "ScanInformation", "StoryArc", "StoryArcNumber", "SeriesGroup", 
             "MainCharacterOrTeam"
         ]
-        
+      
         # Field tooltips dictionary
         self.field_tooltips = {
             "Title": "The title of this specific issue or volume (e.g., 'Attack on Titan #1')",
@@ -2177,7 +2281,102 @@ class MetadataGUI(tk.Tk):
         # Center the main window AFTER all widgets are created
         self.update_idletasks()
         center_window(self, 1600, 1000)
+
+    def setup_drag_drop(self):
+        """Setup drag and drop functionality"""
+        # Enable drag and drop for the file listbox
+        self.file_listbox.drop_target_register(tkdnd.DND_FILES)
+        self.file_listbox.dnd_bind('<<Drop>>', self.on_drop)
+        self.file_listbox.dnd_bind('<<DragEnter>>', self.on_drag_enter)
+        self.file_listbox.dnd_bind('<<DragLeave>>', self.on_drag_leave)
         
+        # Also enable for the main window as a fallback
+        self.drop_target_register(tkdnd.DND_FILES)
+        self.dnd_bind('<<Drop>>', self.on_drop)
+        self.dnd_bind('<<DragEnter>>', self.on_drag_enter)
+        self.dnd_bind('<<DragLeave>>', self.on_drag_leave)
+
+    def on_drag_enter(self, event):
+        """Visual feedback when drag enters the drop zone"""
+        if hasattr(self, 'file_listbox'):
+            self.file_listbox.configure(bg='lightblue')
+        return tkdnd.COPY
+
+    def on_drag_leave(self, event):
+        """Reset visual feedback when drag leaves"""
+        if hasattr(self, 'file_listbox'):
+            self.file_listbox.configure(bg='white')
+
+    def on_drop(self, event):
+        """Handle dropped files/folders - direct loading without popups"""
+        try:
+            # Reset visual feedback
+            if hasattr(self, 'file_listbox'):
+                self.file_listbox.configure(bg='white')
+            
+            # Get dropped files/folders
+            dropped_items = self.tk.splitlist(event.data)
+            
+            cbz_files = []
+            folders_processed = 0
+            invalid_files = []
+            
+            for item in dropped_items:
+                if os.path.isfile(item):
+                    # It's a file - check if it's a CBZ
+                    if item.lower().endswith('.cbz'):
+                        cbz_files.append(item)
+                    else:
+                        # Collect invalid files for logging
+                        invalid_files.append(os.path.basename(item))
+                
+                elif os.path.isdir(item):
+                    # It's a folder - scan for CBZ files recursively
+                    folder_cbz_count = 0
+                    for root, dirs, files in os.walk(item):
+                        for file in files:
+                            if file.lower().endswith('.cbz'):
+                                cbz_files.append(os.path.join(root, file))
+                                folder_cbz_count += 1
+                    
+                    folders_processed += 1
+                    
+                    # Log folder processing results
+                    folder_name = os.path.basename(item)
+                    if folder_cbz_count > 0:
+                        print(f"Found {folder_cbz_count} CBZ files in folder: {folder_name}")
+                    else:
+                        print(f"No CBZ files found in folder: {folder_name}")
+            
+            # Process CBZ files if any were found
+            if cbz_files:
+                # Sort files for consistent ordering
+                cbz_files.sort()
+                
+                # Load files directly
+                self._process_cbz_files(cbz_files)
+                
+                # Log results to console
+                total_files = len(cbz_files)
+                print(f"Successfully loaded {total_files} CBZ files!")
+                if folders_processed > 0:
+                    print(f"Processed {folders_processed} folders")
+                if invalid_files:
+                    print(f"Skipped {len(invalid_files)} non-CBZ files: {', '.join(invalid_files[:5])}")
+                    if len(invalid_files) > 5:
+                        print(f"   ... and {len(invalid_files) - 5} more")
+            else:
+                # Log when no CBZ files found
+                if dropped_items:
+                    print("No CBZ files found in dropped items")
+                    if invalid_files:
+                        print(f"Skipped files: {', '.join(invalid_files)}")
+            
+        except Exception as e:
+            logging.error(f"Error processing dropped items: {e}")
+            print(f"Error processing dropped files: {str(e)}")
+        
+        return tkdnd.COPY
       
     def disable_middle_click_paste(self, widget):
         """Disable middle-click paste functionality for text widgets"""
@@ -2225,27 +2424,31 @@ class MetadataGUI(tk.Tk):
     def create_widgets(self):
         main_frame = ttk.Frame(self)
         main_frame.pack(fill='both', expand=True, padx=10, pady=10)
-    
+
         # === Top Metadata Section ===
         top_frame = ttk.LabelFrame(main_frame, text="File Selection & Metadata Source", padding=10)
         top_frame.pack(fill='x', pady=(0, 10))
-    
+
         file_frame = ttk.Frame(top_frame)
         file_frame.pack(fill='x', pady=(0, 10))
-    
-        ttk.Label(file_frame, text="CBZ Files:").pack(anchor='w')
+
+        ttk.Label(file_frame, text="CBZ Files (drag & drop supported):").pack(anchor='w')
         file_list_frame = ttk.Frame(file_frame)
         file_list_frame.pack(fill='x')
-    
+
         self.file_listbox = tk.Listbox(file_list_frame, height=4)
         self.file_listbox.pack(side='left', fill='both', expand=True)
         self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
-        ToolTip(self.file_listbox, "List of selected CBZ files. Click on a file to select it for editing.")
-    
+        ToolTip(self.file_listbox, 
+                "List of CBZ files for processing\n\n"
+                "Click to select a file for editing\n"
+                "Drag & drop CBZ files or folders here\n"
+                "Supports recursive folder scanning")
+
         file_scroll = ttk.Scrollbar(file_list_frame, orient='vertical', command=self.file_listbox.yview)
         file_scroll.pack(side='right', fill='y')
         self.file_listbox.configure(yscrollcommand=file_scroll.set)
-    
+
         # File selection buttons with tooltips
         select_folder_btn = ttk.Button(file_list_frame, text="Select Folder", command=self.browse_cbz_folder)
         select_folder_btn.pack(side='right', padx=(5, 0))
@@ -2254,17 +2457,17 @@ class MetadataGUI(tk.Tk):
         select_cbz_btn = ttk.Button(file_list_frame, text="Select CBZ", command=self.browse_cbz_files)
         select_cbz_btn.pack(side='right', padx=(5, 0))
         ToolTip(select_cbz_btn, "Browse and select individual CBZ files")
-    
+
         title_frame = ttk.Frame(top_frame)
         title_frame.pack(fill='x', pady=(0, 10))
-    
+
         mode_frame = ttk.Frame(title_frame)
         mode_frame.pack(fill='x', pady=(0, 5))
-    
+
         ttk.Label(mode_frame, text="Metadata Mode:").pack(anchor='w')
         mode_radio_frame = ttk.Frame(mode_frame)
         mode_radio_frame.pack(fill='x')
-    
+
         batch_radio = ttk.Radiobutton(mode_radio_frame, text="Same metadata for all files", variable=self.metadata_mode, value="batch")
         batch_radio.pack(anchor='w')
         ToolTip(batch_radio, "Apply the same metadata to all selected files (batch mode)")
@@ -2272,26 +2475,26 @@ class MetadataGUI(tk.Tk):
         individual_radio = ttk.Radiobutton(mode_radio_frame, text="Different metadata per file", variable=self.metadata_mode, value="individual")
         individual_radio.pack(anchor='w')
         ToolTip(individual_radio, "Use different metadata for each file based on filename matching")
-    
-        local_only_check = ttk.Checkbutton(top_frame, text="🗂️ Local Only Mode (No API requests)", variable=self.local_only_mode)
+
+        local_only_check = ttk.Checkbutton(top_frame, text="Local Only Mode (No API requests)", variable=self.local_only_mode)
         local_only_check.pack(anchor='w', pady=(2, 0))
         ToolTip(local_only_check, "Enable to work only with local database, disable online metadata fetching")
-    
+
         ttk.Label(title_frame, text="Manga Title:").pack(anchor='w')
         title_entry_frame = ttk.Frame(title_frame)
         title_entry_frame.pack(fill='x')
-    
+
         self.title_var = tk.StringVar()
         self.title_entry = ttk.Entry(title_entry_frame, textvariable=self.title_var, font=('TkDefaultFont', 10))
         self.title_entry.pack(side='left', fill='x', expand=True)
         self.disable_middle_click_paste(self.title_entry)
         ToolTip(self.title_entry, "Enter the manga/comic series title to search for metadata")
-    
+
         # Metadata fetch buttons with tooltips
         fetch_anilist_btn = ttk.Button(title_entry_frame, text="Fetch AniList", command=self.fetch_anilist_metadata_gui)
         fetch_anilist_btn.pack(side='right', padx=(5, 0))
         ToolTip(fetch_anilist_btn, "Fetch metadata from AniList database")
-        
+
         refetch_btn = ttk.Button(title_entry_frame, text="Re-Fetch This File", command=self.fetch_metadata_for_current_file)
         refetch_btn.pack(side='right', padx=(5, 0))
         ToolTip(refetch_btn, "Re-fetch metadata for the currently selected file")
@@ -2299,58 +2502,58 @@ class MetadataGUI(tk.Tk):
         fetch_metadata_btn = ttk.Button(title_entry_frame, text="Fetch Metadata", command=self.fetch_metadata_smart)
         fetch_metadata_btn.pack(side='right', padx=(5, 0))
         ToolTip(fetch_metadata_btn, "Search for and fetch metadata from online sources")
-    
+
         self.progress_frame = ttk.Frame(title_frame)
         self.progress_var = tk.StringVar(value="")
         self.progress_label = ttk.Label(self.progress_frame, textvariable=self.progress_var)
         self.progress_bar = ttk.Progressbar(self.progress_frame, mode='determinate')
-    
+
         series_db_frame = ttk.Frame(top_frame)
         series_db_frame.pack(fill='x', pady=(10, 0))
-    
+
         ttk.Label(series_db_frame, text="Series Database:", font=('TkDefaultFont', 9, 'bold')).pack(side='left')
         
         # Series database buttons with tooltips
-        save_aliases_btn = ttk.Button(series_db_frame, text="📂 Save Series + Aliases", command=self.save_current_series_with_aliases)
+        save_aliases_btn = ttk.Button(series_db_frame, text="Save Series + Aliases", command=self.save_current_series_with_aliases)
         save_aliases_btn.pack(side='left', padx=(10, 5))
         ToolTip(save_aliases_btn, "Save current series metadata to database with alias editing")
         
-        save_quick_btn = ttk.Button(series_db_frame, text="📂 Save (Quick)", command=self.save_current_series)
+        save_quick_btn = ttk.Button(series_db_frame, text="Save (Quick)", command=self.save_current_series)
         save_quick_btn.pack(side='left', padx=(0, 5))
         ToolTip(save_quick_btn, "Quickly save current series metadata to database")
         
-        load_series_btn = ttk.Button(series_db_frame, text="📚 Load Series", command=self.load_series_from_db)
+        load_series_btn = ttk.Button(series_db_frame, text="Load Series", command=self.load_series_from_db)
         load_series_btn.pack(side='left', padx=(0, 5))
         ToolTip(load_series_btn, "Load previously saved series metadata from database")
         
-        manage_series_btn = ttk.Button(series_db_frame, text="🗂️ Manage Series", command=self.open_series_manager)
+        manage_series_btn = ttk.Button(series_db_frame, text="Manage Series", command=self.open_series_manager)
         manage_series_btn.pack(side='left', padx=(0, 5))
         ToolTip(manage_series_btn, "Open series database manager to view, edit, and organize saved series")
         
         ttk.Separator(series_db_frame, orient='vertical').pack(side='left', fill='y', padx=5)
         
-        match_file_btn = ttk.Button(series_db_frame, text="🔍 Match File", command=self._match_current_file_with_db)
+        match_file_btn = ttk.Button(series_db_frame, text="Match File", command=self._match_current_file_with_db)
         match_file_btn.pack(side='left', padx=(0, 5))
         ToolTip(match_file_btn, "Try to match current file with saved series using filename analysis")
         
-        match_all_btn = ttk.Button(series_db_frame, text="🔍 Match All", command=self._match_all_files_with_db)
+        match_all_btn = ttk.Button(series_db_frame, text="Match All", command=self._match_all_files_with_db)
         match_all_btn.pack(side='left', padx=(0, 5))
         ToolTip(match_all_btn, "Try to match all files with saved series using filename analysis")
-    
+
         self.dropdown = ttk.Combobox(top_frame, textvariable=self.dropdown_var, state='readonly', font=('TkDefaultFont', 10))
         self.dropdown.pack(fill='x', pady=(10, 0))
         self.dropdown.bind("<<ComboboxSelected>>", self.update_metadata_from_dropdown)
         ToolTip(self.dropdown, "Select from available metadata options found during search")
-    
+
         nav_frame = ttk.Frame(main_frame)
         nav_frame.pack(fill='x', pady=(0, 10))
-    
+
         # Navigation and utility buttons with tooltips
-        prev_btn = ttk.Button(nav_frame, text="◄ Previous", command=self.prev_file)
+        prev_btn = ttk.Button(nav_frame, text="Previous", command=self.prev_file)
         prev_btn.pack(side='left', padx=(0, 5))
         ToolTip(prev_btn, "Navigate to the previous file in the list")
         
-        next_btn = ttk.Button(nav_frame, text="Next ►", command=self.next_file)
+        next_btn = ttk.Button(nav_frame, text="Next", command=self.next_file)
         next_btn.pack(side='left', padx=(0, 15))
         ToolTip(next_btn, "Navigate to the next file in the list")
         
@@ -2358,58 +2561,62 @@ class MetadataGUI(tk.Tk):
         auto_fill_btn.pack(side='left', padx=(0, 5))
         ToolTip(auto_fill_btn, "Automatically extract volume/issue numbers from filename")
         
+        auto_fill_chapter_btn = ttk.Button(nav_frame, text="Auto-Fill Chapter", command=self.fill_chapter_info)
+        auto_fill_chapter_btn.pack(side='left', padx=(0, 5))
+        ToolTip(auto_fill_chapter_btn, "Automatically extract chapter/issue numbers from filename")
+        
         count_pages_btn = ttk.Button(nav_frame, text="Count Pages", command=self.fill_page_count)
         count_pages_btn.pack(side='left', padx=(0, 5))
         ToolTip(count_pages_btn, "Count and fill in the number of pages in the CBZ file")
         
-        bulk_edit_check = ttk.Checkbutton(nav_frame, text="📝 Bulk Edit All Files", variable=self.bulk_edit_enabled)
+        bulk_edit_check = ttk.Checkbutton(nav_frame, text="Bulk Edit All Files", variable=self.bulk_edit_enabled)
         bulk_edit_check.pack(side='right')
         ToolTip(bulk_edit_check, "When enabled, changes apply to all files instead of just the current file")
-    
+
         metadata_frame = ttk.LabelFrame(main_frame, text="Metadata Editor", padding=5)
         metadata_frame.pack(fill='both', expand=True, pady=(0, 10))
-    
+
         canvas = tk.Canvas(metadata_frame)
         scrollbar = ttk.Scrollbar(metadata_frame, orient="vertical", command=canvas.yview)
         scroll_frame = ttk.Frame(canvas)
-    
+
         self.canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(self.canvas_window, width=e.width))
         scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.configure(yscrollcommand=scrollbar.set)
-    
+
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-    
+
         scroll_frame.grid_columnconfigure(1, weight=1)
         scroll_frame.grid_columnconfigure(3, weight=1)
-    
+
         # Column headers
         ttk.Label(scroll_frame, text="Field", font=('TkDefaultFont', 9, 'bold')).grid(row=1, column=0, sticky='w', padx=(5, 0))
         ttk.Label(scroll_frame, text="Original Metadata", font=('TkDefaultFont', 9, 'bold')).grid(row=1, column=1, sticky='ew', padx=5)
-        ttk.Label(scroll_frame, text="→", font=('TkDefaultFont', 9, 'bold')).grid(row=1, column=2, sticky='w', padx=(0, 5))
+        ttk.Label(scroll_frame, text="™", font=('TkDefaultFont', 9, 'bold')).grid(row=1, column=2, sticky='w', padx=(0, 5))
         ttk.Label(scroll_frame, text="Updated Metadata", font=('TkDefaultFont', 9, 'bold')).grid(row=1, column=3, sticky='ew', padx=5)
-    
+
         self.copy_buttons = {}
         self.form_rows = {}
-    
+
         # Create form fields with tooltips
         for i, field in enumerate(self.fields):
             row = i + 2
-    
+
             label = ttk.Label(scroll_frame, text=field, font=('TkDefaultFont', 8))
             label.grid(row=row, column=0, sticky='nw', padx=(5, 10), pady=2)
             ToolTip(label, self.field_tooltips.get(field, f"Metadata field: {field}"))
-    
+
             before = tk.Text(scroll_frame, height=1, width=50, wrap='word', font=('TkDefaultFont', 8), state='disabled', bg='#f0f0f0')
             before.grid(row=row, column=1, sticky='nsew', padx=(5, 2), pady=2)
             self.disable_middle_click_paste(before)
             ToolTip(before, f"Original {field} metadata from the CBZ file (read-only)")
-    
-            copy_btn = ttk.Button(scroll_frame, text="→", width=3, command=lambda f=field: self.copy_field(f))
+
+            copy_btn = ttk.Button(scroll_frame, text="™", width=3, command=lambda f=field: self.copy_field(f))
             copy_btn.grid(row=row, column=2, padx=(2, 2), pady=2)
             ToolTip(copy_btn, f"Copy original {field} value to the updated field")
-    
+
             if field == "AgeRating":
                 after = ttk.Combobox(scroll_frame, values=self.age_rating_options, font=('TkDefaultFont', 8), width=50)
                 after.bind('<<ComboboxSelected>>', lambda e, f=field: self.on_dropdown_change(f))
@@ -2429,16 +2636,16 @@ class MetadataGUI(tk.Tk):
                 ToolTip(after, self.field_tooltips.get(field, f"Enter {field} metadata"))
             
             after.grid(row=row, column=3, sticky='nsew', padx=(2, 2), pady=2)
-    
-            clear_btn = ttk.Button(scroll_frame, text="✙", width=3, command=lambda f=field: self.clear_field(f))
+
+            clear_btn = ttk.Button(scroll_frame, text="¢", width=3, command=lambda f=field: self.clear_field(f))
             clear_btn.grid(row=row, column=4, padx=(2, 5), pady=2)
             ToolTip(clear_btn, f"Clear the {field} field")
-    
+
             self.before_entries[field] = before
             self.after_entries[field] = after
             self.copy_buttons[field] = copy_btn
             self.form_rows[field] = (label, before, copy_btn, after, clear_btn)
-    
+
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         
@@ -2453,24 +2660,31 @@ class MetadataGUI(tk.Tk):
         canvas.bind('<Leave>', _unbind_from_mousewheel)
         scrollbar.bind('<Enter>', _bind_to_mousewheel) 
         scrollbar.bind('<Leave>', _unbind_from_mousewheel)
-    
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill='x')
-    
+
+        self.button_frame = ttk.Frame(main_frame)  # Store reference for drag/drop
+        self.button_frame.pack(fill='x')
+
         # Main action buttons with tooltips
-        insert_btn = ttk.Button(button_frame, text="Insert Metadata into All CBZs", command=self.insert_metadata, style='Accent.TButton')
+        insert_btn = ttk.Button(self.button_frame, text="Insert Metadata into All CBZs", command=self.insert_metadata, style='Accent.TButton')
         insert_btn.pack(side='left', padx=(0, 10))
         insert_btn.bind("<Button-3>", lambda e: self._reset_thread_count())  # Right-click
         ToolTip(insert_btn, "Left Click - Apply the current metadata to all selected CBZ files, Right Click - Modify CPU Thread Setting")
         
-        copy_all_btn = ttk.Button(button_frame, text="Copy All Fields", command=self.copy_all_fields)
+        copy_all_btn = ttk.Button(self.button_frame, text="Copy All Fields", command=self.copy_all_fields)
         copy_all_btn.pack(side='left', padx=(0, 5))
         ToolTip(copy_all_btn, "Copy all original metadata values to the updated fields")
         
-        clear_all_btn = ttk.Button(button_frame, text="Clear All Fields", command=self.clear_all_fields)
+        clear_all_btn = ttk.Button(self.button_frame, text="Clear All Fields", command=self.clear_all_fields)
         clear_all_btn.pack(side='left', padx=(0, 5))
         ToolTip(clear_all_btn, "Clear all metadata fields (both original and updated)")
 
+        # Set up drag and drop AFTER all widgets are created
+        self.setup_drag_drop()
+        
+        # Add visual hint to the file listbox when no files are loaded
+        if self.file_listbox.size() == 0:
+            self.file_listbox.insert(0, "Drag and drop CBZ files or folders here...")
+            self.file_listbox.configure(fg='gray')
 
     def on_dropdown_change(self, field):
         """Handle dropdown field changes"""
@@ -2480,12 +2694,12 @@ class MetadataGUI(tk.Tk):
         """Update metadata for one or all files based on bulk edit mode"""
         if not self.cbz_paths:
             return
-    
+
         if field in ["AgeRating", "Format"]:
             value = self.after_entries[field].get()
         else:
             value = self.after_entries[field].get("1.0", tk.END).strip()
-    
+
         if self.bulk_edit_enabled.get():
             for file in self.cbz_paths:
                 if file in self.file_metadata:
@@ -2505,13 +2719,13 @@ class MetadataGUI(tk.Tk):
         """Populate metadata dropdown based on current file (individual mode)"""
         if not self.cbz_paths or self.current_index >= len(self.cbz_paths):
             return
-    
+
         current_file = self.cbz_paths[self.current_index]
-    
+
         if self.metadata_mode.get() == "individual" and current_file in self.individual_metadata_cache:
             cache_data = self.individual_metadata_cache[current_file]
             self.metadata_options = cache_data.get('options', [])
-    
+
             dropdown_values = []
             for meta in self.metadata_options:
                 title_text = meta.get("Title", "Unknown")
@@ -2528,9 +2742,9 @@ class MetadataGUI(tk.Tk):
                     parts.append(f"({content_rating_text.title()})")
             
                 dropdown_values.append(" ".join(parts))
-    
+
             self.dropdown['values'] = dropdown_values
-    
+
             # Restore user's last selection if available
             selected_idx = self.dropdown_selection_per_file.get(current_file, 0)
             if selected_idx < len(dropdown_values):
@@ -2548,37 +2762,43 @@ class MetadataGUI(tk.Tk):
             filetypes=[("CBZ files", "*.cbz")]
         )
         self._process_cbz_files(file_paths)
-    
+
     def browse_cbz_folder(self):
         folder = filedialog.askdirectory(title="Select Folder Containing CBZs")
         if not folder:
             return
-    
+
         cbz_files = []
         for root, _, files in os.walk(folder):
             for f in files:
                 if f.lower().endswith(".cbz"):
                     cbz_files.append(os.path.join(root, f))
-    
+
         self._process_cbz_files(cbz_files)
         
     def _process_cbz_files(self, paths):
         if not paths:
             return
-    
+
+        # Clear placeholder text if it exists
+        if (self.file_listbox.size() == 1 and 
+            "Drag and drop CBZ files" in self.file_listbox.get(0)):
+            self.file_listbox.delete(0)
+            self.file_listbox.configure(fg='black')
+
         self.cbz_paths = list(paths)
         self.file_listbox.delete(0, tk.END)
         self.file_metadata.clear()
         self.original_metadata.clear()
-    
+
         first_title = auto_extract_title(os.path.basename(self.cbz_paths[0]))
         self.title_var.set(first_title)
-    
+
         for path in self.cbz_paths:
             self.file_listbox.insert(tk.END, os.path.basename(path))
             meta = {field: "" for field in self.fields}
             self.file_metadata[path] = meta.copy()
-    
+
             try:
                 with zipfile.ZipFile(path, 'r') as cbz:
                     if "ComicInfo.xml" in cbz.namelist():
@@ -2591,14 +2811,13 @@ class MetadataGUI(tk.Tk):
                                     meta[field] = element.text.strip()
             except Exception as e:
                 logging.warning(f"Failed to read ComicInfo.xml from {path}: {e}")
-    
+
             self.original_metadata[path] = meta.copy()
-    
+
         if self.cbz_paths:
             self.file_listbox.select_set(0)
             self.current_index = 0
             self.load_metadata(0)
-
 
     def clear_all_fields(self):
         """Clear all metadata fields for current file"""
@@ -2606,7 +2825,10 @@ class MetadataGUI(tk.Tk):
             return
             
         for field in self.fields:
-            self.after_entries[field].delete("1.0", tk.END)
+            if field in ["AgeRating", "Format"]:
+                self.after_entries[field].set("")
+            else:
+                self.after_entries[field].delete("1.0", tk.END)
             if self.current_index < len(self.cbz_paths):
                 current_file = self.cbz_paths[self.current_index]
                 self.file_metadata[current_file][field] = ""
@@ -2645,7 +2867,7 @@ class MetadataGUI(tk.Tk):
             
             try:
                 if series_db.save_series_metadata(series_name, series_metadata):
-                    messagebox.showinfo("Success", f"Series '{series_name}' saved to database")
+                    print("Success", f"Series '{series_name}' saved to database")
                 else:
                     messagebox.showerror("Error", f"Failed to save series '{series_name}'")
             except Exception as e:
@@ -2755,13 +2977,13 @@ class MetadataGUI(tk.Tk):
                 if dialog.result is not None:
                     series_db.save_series_aliases(series_name, dialog.result)
                 
-                messagebox.showinfo("Success", f"Series '{series_name}' saved to database")
+                print("Success", f"Series '{series_name}' saved to database")
             else:
                 messagebox.showerror("Error", f"Failed to save series '{series_name}'")
         except Exception as e:
             logging.error(f"Error saving series: {e}")
             messagebox.showerror("Error", f"Failed to save series: {str(e)}")
-    
+
     # Update the _find_best_match method to use aliases:
     def _find_best_match(self, extracted_title, all_series):
         """Find the best matching series title from the database (now includes aliases)"""
@@ -2849,61 +3071,48 @@ class MetadataGUI(tk.Tk):
         
     
     def _extract_volume_from_filename(self, filename):
-        """Extract volume number from filename"""
-        import re
-        
-        # Common volume patterns
-        volume_patterns = [
-            r'(?:vol|volume|v)[\s._-]*(\d+)',
-            r'(\d+)(?:st|nd|rd|th)?\s*(?:vol|volume)',
-            r'v(\d+)',
-            r'volume\s*(\d+)'
-        ]
-        
+        """Extract volume number from filename (class method)"""
         filename_lower = filename.lower()
         
-        for pattern in volume_patterns:
-            match = re.search(pattern, filename_lower)
-            if match:
-                return match.group(1)
+        # Try all patterns in order of likelihood
+        match = VOLUME_PATTERN.search(filename_lower)
+        if match:
+            return match.group(1)
+        
+        match = REVERSED_VOLUME_PATTERN.search(filename_lower)
+        if match:
+            return match.group(1)
+        
+        match = STANDALONE_V_PATTERN.search(filename_lower)
+        if match:
+            return match.group(1)
         
         return ""
+
     
     def _clean_title_for_matching(self, title):
-        """
-        Clean title by:
-          1) removing ALL [bracketed] or (parenthetical) tags,
-          2) stripping chapter/volume markers,
-          3) trimming trailing punctuation/spaces.
-        """
-        import re
-    
+        """Clean title preserving ordinal numbers like '7th Time Loop'"""
         cleaned = title
-    
-        # 1) Nuke bracket- and paren- tags in-place
-        #    (removes "[...]" and "(...)" anywhere, but leaves text before/after intact)
-        cleaned = re.sub(r'\[.*?\]|\(.*?\)', '', cleaned)
-    
-        # 2) Remove chapter/volume markers _after_ that
-        chapter_vol_patterns = [
-            r'\bCh\.?\s*\d+.*$',      # Ch. 12, Ch12…
-            r'\bChapter\s*\d+.*$',    # Chapter 3…
-            r'\bC\d+.*$',             # C12…
-            r'\bVol\.?\s*\d+.*$',     # Vol. 1…
-            r'\bVolume\s*\d+.*$',     # Volume 2…
-            r'\bV\d+.*$',             # V2…
-            r'\d+\.\d+.*$',           # 1.1, 2.5…
-        ]
-        for pat in chapter_vol_patterns:
-            cleaned = re.sub(pat, '', cleaned, flags=re.IGNORECASE).strip()
-    
-        # 3) Trim off any leftover punctuation / separators at end
-        cleaned = re.sub(r'[\s\-_–—~\.\,\:\!\?\[\]\(\)\{\}]+$', '', cleaned)
-    
-        # Collapse multiple spaces to one
-        cleaned = ' '.join(cleaned.split())
-    
+        
+        # Remove brackets and parentheses
+        cleaned = BRACKET_CONTENT_PATTERN.sub('', cleaned)
+        cleaned = PAREN_CONTENT_PATTERN.sub('', cleaned)
+        
+        # Remove volume/chapter markers (word boundaries preserve ordinals)
+        cleaned = VOLUME_PATTERN.sub('', cleaned)
+        cleaned = CHAPTER_PATTERN.sub('', cleaned)
+        
+        # Remove quality tags if patterns exist
+        if 'RESOLUTION_PATTERN' in globals():
+            cleaned = RESOLUTION_PATTERN.sub('', cleaned)
+        if 'QUALITY_PATTERN' in globals():
+            cleaned = QUALITY_PATTERN.sub('', cleaned)
+        
+        # Normalize whitespace
+        cleaned = WHITESPACE_PATTERN.sub(' ', cleaned).strip()
+        
         return cleaned
+
     
     def _normalize_for_comparison(self, title):
         """Normalize title for comparison by removing special characters and converting to lowercase"""
@@ -2970,7 +3179,7 @@ class MetadataGUI(tk.Tk):
                 
                 # Auto-extract volume if not already set
                 if not file_specific_data['Volume']:
-                    volume = self._extract_volume_from_filename(filename)
+                    volumes = self._extract_volume_from_filename(filename)
                     if volume:
                         self.file_metadata[current_file]['Volume'] = volume
                 
@@ -3000,7 +3209,7 @@ class MetadataGUI(tk.Tk):
             extracted_title = self._extract_title_from_filename(filename)
             
             if not extracted_title:
-                match_results.append(f"❌ {filename} - Could not extract title")
+                match_results.append(f"Ã¢ÂÅ’ {filename} - Could not extract title")
                 continue
             
             # Search for matching series (now includes aliases)
@@ -3027,11 +3236,11 @@ class MetadataGUI(tk.Tk):
                             self.file_metadata[cbz_path]['Volume'] = volume
                     
                     matched_files += 1
-                    match_results.append(f"✅ {filename} → {best_match}")
+                    match_results.append(f"{filename} {best_match}")
                 else:
-                    match_results.append(f"❌ {filename} - Failed to load '{best_match}' metadata")
+                    match_results.append(f"{filename} - Failed to load '{best_match}' metadata")
             else:
-                match_results.append(f"❌ {filename} - No match found")
+                match_results.append(f"{filename} - No match found")
         
         # Refresh display
         self.load_metadata(self.current_index)
@@ -3247,57 +3456,82 @@ class MetadataGUI(tk.Tk):
 
 
     @staticmethod
-    def extract_metadata(entry):
-        """Extract metadata from API response entry - WITH UPDATED PUBLISHER LOGIC"""
-    
+    def extract_metadata(entry, filename=None):
+        """Extract metadata from API response entry - WITH UPDATED PUBLISHER LOGIC and filename parsing"""
+
         def safe_list(val):
             if isinstance(val, list):
                 return val
             elif isinstance(val, str):
                 return [val]
             return []
-    
+
         def safe_get(obj, key, default=""):
             return str(obj.get(key, default)) if obj.get(key) is not None else default
-    
-        # Handle links
+
+        # Handle links from both 'links' and 'source' fields
         links = entry.get("links", [])
         if isinstance(links, str):
             links = [links]
         elif not isinstance(links, list):
             links = []
-    
+
         links = [link for link in links if link]
+        
+        # NEW: Process 'source' field to extract additional links
+        source = entry.get("source", {})
+        if isinstance(source, dict):
+            # Use constants for URL patterns
+            source_url_patterns = {
+                "manga_updates": (SOURCE_URL_PATTERNS["manga_updates"], "id"),
+                "my_anime_list": (SOURCE_URL_PATTERNS["my_anime_list"], "id"),
+                "anilist": (SOURCE_URL_PATTERNS["anilist"], "id"),
+                "anime_planet": (SOURCE_URL_PATTERNS["anime_planet"], "id"),
+                "kitsu": (SOURCE_URL_PATTERNS["kitsu"], "id"),
+                "shikimori": (SOURCE_URL_PATTERNS["shikimori"], "id"),
+                "anime_news_network": (SOURCE_URL_PATTERNS["anime_news_network"], "id")
+            }
+            
+            for source_name, (base_url, id_key) in source_url_patterns.items():
+                source_data = source.get(source_name, {})
+                if isinstance(source_data, dict):
+                    source_id = source_data.get(id_key)
+                    # Enhanced validation using helper function
+                    if is_valid_source_id(source_id, source_name):
+                        source_id_str = str(source_id).strip().strip('"')
+                        constructed_url = f"{base_url}{source_id_str}"
+                        links.append(constructed_url)
+        
         web_links = MetadataGUI.clean_links('; '.join(links))
-    
+
         # NEW PUBLISHER LOGIC - English publisher first, rest in Imprint
         publishers = entry.get("publishers", [])
         pub_text = ""
         imprint_text = ""
-    
+
         if isinstance(publishers, list) and publishers:
             publisher_infos = []
-    
+
             for p in publishers:
                 if isinstance(p, dict) and p.get('name') and p.get('type'):
                     name = p.get('name', '').strip()
                     ptype = p.get('type', '').strip()
                     if name:
                         publisher_infos.append((name, ptype))
-    
+
             if publisher_infos:
                 if len(publisher_infos) == 1:
-                    # Only one publisher — goes to Publisher field, Imprint empty
+                    # Only one publisher goes to Publisher field, Imprint empty
                     pub_text = publisher_infos[0][0]
                     imprint_text = ""
                 else:
                     # Prefer English type first
                     english = [p for p in publisher_infos if p[1].lower() in ['english', 'en']]
                     others = [p for p in publisher_infos if p not in english]
-    
+
                     selected = english[0] if english else publisher_infos[0]
                     pub_text = selected[0]  # Only the name, without (type)
-    
+
                     # All go to Imprint with (type), including the selected one
                     imprint_list = [f"{name} ({ptype})" for name, ptype in publisher_infos]
                     imprint_text = ", ".join(imprint_list)
@@ -3332,10 +3566,38 @@ class MetadataGUI(tk.Tk):
             }
             age_rating = rating_map.get(content_rating.lower(), content_rating)
         
+        # Extract chapter number and title from filename if provided
+        chapter_number = ""
+        filename_title = ""
+        if filename:
+            import os
+            basename = os.path.basename(filename)
+            # Remove extension
+            basename_no_ext = os.path.splitext(basename)[0]
+
+            # Extract chapter number using CHAPTER_PATTERN
+            chapter_match = CHAPTER_PATTERN.search(basename_no_ext)
+            if chapter_match:
+                chapter_number = chapter_match.group(1)
+
+            # Extract title from filename (basic cleanup)
+            filename_title = EXTENSION_PATTERN.sub('', basename)
+            # Remove chapter/volume markers
+            filename_title = CHAPTER_PATTERN.sub('', filename_title)
+            filename_title = VOLUME_PATTERN.sub('', filename_title)
+            # Clean up brackets and parentheses content
+            filename_title = BRACKET_CONTENT_PATTERN.sub('', filename_title)
+            filename_title = PAREN_CONTENT_PATTERN.sub('', filename_title)
+            # Clean up whitespace
+            filename_title = WHITESPACE_PATTERN.sub(' ', filename_title).strip()
+
+        # Use filename title as fallback if API title is not available
+        final_title = primary_title if primary_title else filename_title
+
         return {
-            "Title": primary_title,
-            "Series": primary_title,
-            "Number": "",
+            "Title": final_title,
+            "Series": final_title,
+            "Number": chapter_number,
             "Volume": "",
             "Summary": MetadataGUI.clean_html_description(safe_get(entry, "description")),
             "Writer": ", ".join(safe_list(entry.get("authors", []))),
@@ -3343,19 +3605,19 @@ class MetadataGUI(tk.Tk):
             "Inker": ", ".join(safe_list(entry.get("artists", []))),
             "Colorist": ", ".join(safe_list(entry.get("artists", []))),
             "Publisher": pub_text,
-            "Imprint": imprint_text,  # NEW: Additional publishers go here
+            "Imprint": imprint_text,
             "Genre": ", ".join(safe_list(entry.get("genres", []))),
             "Tags": ", ".join(safe_list(entry.get("tags", []))),
             "Year": safe_get(entry, "year"),
             "LanguageISO": safe_get(entry, "lang", "en"),
             "Web": web_links,
-            "Count": safe_get(entry, "final_volume") or safe_get(entry, "final_chapter"),
+            "Count": (safe_get(entry, "final_volume") or safe_get(entry, "final_chapter")) if safe_get(entry, "status").lower() in ["completed", "canceled", "cancelled"] else "",
             "PageCount": "",
             "Teams": "",
             "Locations": "",
             "LocalizedSeries": localized,
-            "Format": "",  # NEW: Empty by default, user can select
-            "AgeRating": age_rating,  # NEW: Mapped from content_rating
+            "Format": "",
+            "AgeRating": age_rating,
             "type": safe_get(entry, "type"),
             "content_rating": safe_get(entry, "content_rating"),
             "entry_id": safe_get(entry, "id"),
@@ -3366,6 +3628,7 @@ class MetadataGUI(tk.Tk):
                 "secondary": sec
             }
         }
+
 
     @staticmethod
     def clean_links(raw):
@@ -3415,7 +3678,7 @@ class MetadataGUI(tk.Tk):
             cleaned = cleaned.replace(tag, replacement)
         
         # Remove any remaining HTML tags and clean up whitespace
-        cleaned = re.sub(r'<[^>]+>', '', cleaned)
+        cleaned = HTML_TAG_PATTERN.sub( '', cleaned)
         cleaned = re.sub(r'\n\s*\n\s*\n+', '\n\n', cleaned)
         
         return cleaned.strip()
@@ -3424,7 +3687,6 @@ class MetadataGUI(tk.Tk):
         """Save current form data to metadata storage"""
         if not self.cbz_paths or self.current_index >= len(self.cbz_paths):
             return
-            
         current_file = self.cbz_paths[self.current_index]
         metadata = {}
         for field in self.fields:
@@ -3432,8 +3694,25 @@ class MetadataGUI(tk.Tk):
                 metadata[field] = self.after_entries[field].get()
             else:
                 metadata[field] = self.after_entries[field].get("1.0", tk.END).strip()
-        self.file_metadata[current_file] = metadata
         
+        with self._metadata_lock:  # Add thread safety
+            self.file_metadata[current_file] = metadata
+
+    def cleanup_temp_files(self):
+        """Clean up any leftover temporary files"""
+        if not self.cbz_paths:
+            return
+        
+        for cbz_path in self.cbz_paths:
+            temp_path = cbz_path + '.tmp'
+            try:
+                os.remove(temp_path)
+                logging.info(f"Cleaned up temp file: {temp_path}")
+            except FileNotFoundError:
+                pass  # File already deleted
+            except OSError as e:
+                logging.warning(f"Could not remove temp file {temp_path}: {e}")
+            
     def on_file_select(self, event):
         """Enhanced file selection handler"""
         selection = self.file_listbox.curselection()
@@ -3486,10 +3765,10 @@ class MetadataGUI(tk.Tk):
             self.fetch_metadata_individual()
 
     def fetch_metadata_batch_fixed(self):
-        """FIXED version of fetch_metadata_batch"""
+        """FIXED version of fetch_metadata_batch - no popups"""
         title = self.title_var.get().strip()
         if not title:
-            messagebox.showerror("Error", "Please enter a manga title")
+            print("’ Error: Please enter a manga title")
             return
             
         try:
@@ -3499,14 +3778,16 @@ class MetadataGUI(tk.Tk):
             raw_entries = find_best_match_merge_aware(title)  # This returns raw entries
             
             if not raw_entries:
-                messagebox.showinfo("No Results", "No metadata found for this title")
+                print(f"’ No metadata found for title: '{title}'")
                 return
             
             # Extract metadata from raw entries
             self.metadata_options = []
             for entry in raw_entries:
-                metadata = self.extract_metadata(entry)
+                current_file = self.cbz_paths[self.current_index] if self.current_index < len(self.cbz_paths) else None
+                metadata = self.extract_metadata(entry, current_file)
                 self.metadata_options.append(metadata)
+
             
             # Update dropdown with results - FIXED LOGIC
             dropdown_values = []
@@ -3532,40 +3813,44 @@ class MetadataGUI(tk.Tk):
                 
                 display_name = " ".join(parts)
                 dropdown_values.append(display_name)
-                
-
+            
             self.dropdown['values'] = dropdown_values
-            self.dropdown.set("Select a metadata match...")
             
             if len(self.metadata_options) == 1:
                 # Auto-select if only one result
                 self.dropdown.set(dropdown_values[0])
                 self.update_metadata_from_dropdown()
+                print(f" Found 1 match for '{title}' - automatically selected")
             else:
-                messagebox.showinfo("Multiple Results", 
-                                  f"Found {len(self.metadata_options)} matches. Please select one from the dropdown.")
+                # Set to first option but don't auto-update
+                self.dropdown.set(dropdown_values[0])
+                print(f" Found {len(self.metadata_options)} matches for '{title}'. First option selected - use dropdown to change.")
                 
         except Exception as e:
             logging.error(f"Error fetching metadata: {e}")
-            messagebox.showerror("Error", f"Failed to fetch metadata: {str(e)}")
+            print(f" Failed to fetch metadata: {str(e)}")
+
 
     def fetch_metadata_individual(self):
-        """Fetch different metadata for each file based on filename"""
-        if not self.cbz_paths:
-            messagebox.showerror("Error", "No CBZ files loaded")
-            return
+        with self._cbz_paths_lock:
+            if not self.cbz_paths:
+                messagebox.showerror("Error", "No CBZ files loaded")
+                return
+            # Get thread-safe copies
+            cbz_paths_for_preview = self.cbz_paths[:3].copy() if len(self.cbz_paths) >= 3 else self.cbz_paths.copy()
+            total_files_count = len(self.cbz_paths)
         
         # Test title extraction first
         test_titles = []
         for cbz_path in self.cbz_paths[:3]:  # Test first 3 files
             filename = os.path.basename(cbz_path)
             title = self._extract_title_from_filename(filename)
-            test_titles.append(f"{filename} → '{title}'")
+            test_titles.append(f"{filename} '{title}'")
         
         # Show user what titles will be extracted
         preview_msg = "Will extract these titles from filenames:\n\n" + "\n".join(test_titles)
-        if len(self.cbz_paths) > 3:
-            preview_msg += f"\n... and {len(self.cbz_paths) - 3} more files"
+        if total_files_count > 3:  # ← USED HERE (line 20) - now works!
+            preview_msg += f"\n... and {total_files_count - 3} more files"
         
         result = messagebox.askyesno("Confirm Title Extraction", 
                                    preview_msg + "\n\nProceed with metadata fetch for ALL files?")
@@ -3612,7 +3897,7 @@ class MetadataGUI(tk.Tk):
             # Extract metadata from raw entries
             metadata_options = []
             for entry in raw_entries:
-                metadata = self.extract_metadata(entry)
+                metadata = self.extract_metadata(entry, cbz_path)
                 metadata_options.append(metadata)
     
             self.individual_metadata_cache[cbz_path] = {
@@ -3621,7 +3906,7 @@ class MetadataGUI(tk.Tk):
             }
             self.dropdown_selection_per_file[cbz_path] = 0
             self.populate_dropdown_for_current_file()
-            messagebox.showinfo("Success", f"Updated metadata options for:\n{filename}")
+            print("Success", f"Updated metadata options for:\n{filename}")
         except Exception as e:
             logging.error(f"Error refetching metadata: {e}")
             messagebox.showerror("Error", f"Failed to refetch metadata: {e}")
@@ -3655,7 +3940,7 @@ class MetadataGUI(tk.Tk):
                             # Extract metadata from raw entries
                             metadata_options = []
                             for entry in raw_entries:
-                                metadata = self.extract_metadata(entry)
+                                metadata = self.extract_metadata(entry, cbz_path)
                                 metadata_options.append(metadata)
                         else:
                             metadata_options = []
@@ -3675,16 +3960,24 @@ class MetadataGUI(tk.Tk):
                     else:
                         failed_fetches.append(filename)
     
-                except Exception as e:
+                except (ValueError, KeyError, TypeError, ConnectionError) as e:
                     failed_fetches.append(f"{filename} (error: {str(e)})")
                     logging.error(f"Error fetching metadata for {filename}: {e}")
+                except Exception as e:
+                    failed_fetches.append(f"{filename} (error: {str(e)})")
+                    logging.critical(f"Unexpected error fetching metadata for {filename}: {e}", exc_info=True)
     
             self.after(0, self._finish_individual_fetch, successful_fetches, total_files,
                        failed_extractions, failed_fetches)
     
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             error_msg = f"Failed to fetch metadata: {str(e)}"
             logging.error(error_msg)
+            self.after(0, lambda: messagebox.showerror("Error", error_msg))
+            self.after(0, self._hide_progress)
+        except Exception as e:
+            error_msg = f"Unexpected error in metadata fetch: {str(e)}"
+            logging.critical(error_msg, exc_info=True)
             self.after(0, lambda: messagebox.showerror("Error", error_msg))
             self.after(0, self._hide_progress)
 
@@ -3702,27 +3995,27 @@ class MetadataGUI(tk.Tk):
         # Create detailed results message
         results = []
         if successful > 0:
-            results.append(f"✓ Successfully fetched metadata for {successful}/{total} files")
+            results.append(f" Successfully fetched metadata for {successful}/{total} files")
         
         if failed_extractions:
-            results.append(f"\n⚠ Could not extract titles from {len(failed_extractions)} files:")
+            results.append(f"¡  Could not extract titles from {len(failed_extractions)} files:")
             for filename in failed_extractions[:5]:  # Show first 5
-                results.append(f"  • {filename}")
+                results.append(f" {filename}")
             if len(failed_extractions) > 5:
                 results.append(f"  ... and {len(failed_extractions) - 5} more")
         
         if failed_fetches:
-            results.append(f"\n⚠ No metadata found for {len(failed_fetches)} files:")
+            results.append(f"  No metadata found for {len(failed_fetches)} files:")
             for filename in failed_fetches[:5]:  # Show first 5
-                results.append(f"  • {filename}")
+                results.append(f" {filename}")
             if len(failed_fetches) > 5:
                 results.append(f"  ... and {len(failed_fetches) - 5} more")
         
         if successful == 0:
-            results.append("\n💡 Tips for better results:")
-            results.append("• Make sure filenames contain the manga title")
-            results.append("• Try removing extra text like '[Group]' or quality tags")
-            results.append("• Use 'Same metadata for all files' if they're the same series")
+            results.append(" Tips for better results:")
+            results.append(" Make sure filenames contain the manga title")
+            results.append(" Try removing extra text like '[Group]' or quality tags")
+            results.append(" Use 'Same metadata for all files' if they're the same series")
             
             messagebox.showinfo("No Results", "\n".join(results))
             return
@@ -3735,21 +4028,43 @@ class MetadataGUI(tk.Tk):
         self._update_file_listbox_indicators()
         
         # Show results
-        messagebox.showinfo("Fetch Complete", "\n".join(results))
+        print("Fetch Complete", "\n".join(results))
 
     def _hide_progress(self):
         """Hide progress UI"""
         self.progress_frame.pack_forget()
 
     def _extract_title_from_filename(self, filename):
-        """Extract title from filename, removing file extension and chapter/volume info"""
+        """Extract title from filename - IMPROVED to handle numbers"""
+        import re
+        
         # Remove file extension
-        name = os.path.splitext(filename)[0]
+        name = filename.replace('.cbz', '').replace('.CBZ', '')
         
-        # Clean the title by removing chapter/volume patterns
-        cleaned_title = self._clean_title_for_matching(name)
+        # Pattern: capture everything before volume/chapter markers
+        # Now handles titles starting with numbers like "2.5 Dimensional Seduction"
+        patterns = [
+            r'^(.+?)\s+v(?:ol)?\.?\s*\d+',  # "Title v01" or "Title vol 1"
+            r'^(.+?)\s+volume\s+\d+',        # "Title Volume 1"
+            r'^(.+?)\s+ch(?:apter)?\.?\s*\d+', # "Title ch01"
+            r'^(.+?)\s+-\s+v\d+',            # "Title - v01"
+            r'^(.+?)\s+\(\d{4}\)',           # "Title (2022)"
+        ]
         
-        return cleaned_title.strip()
+        for pattern in patterns:
+            match = re.search(pattern, name, re.IGNORECASE)
+            if match:
+                title = match.group(1).strip()
+                # Clean up trailing hyphens/dashes
+                title = re.sub(r'[\s\-]+$', '', title)
+                return title
+        
+        # Fallback: remove common suffixes
+        cleaned = re.sub(r'\s*\(.*?\)|\[.*?\]', '', name)  # Remove brackets
+        cleaned = re.sub(r'\s+(Digital|LuCaZ|1r0n|.*?Scan).*$', '', cleaned, flags=re.IGNORECASE)
+        
+        return cleaned.strip() if cleaned.strip() else None
+
 
     def _update_file_listbox_indicators(self):
         """Update file listbox to show which files have metadata"""
@@ -3764,7 +4079,7 @@ class MetadataGUI(tk.Tk):
             filename = os.path.basename(cbz_path)
             # Add indicator if metadata was fetched individually
             if cbz_path in self.individual_metadata_cache:
-                indicator = "✓ "
+                indicator = " "
             else:
                 indicator = ""
             
@@ -3787,12 +4102,17 @@ class MetadataGUI(tk.Tk):
         """Fetch AniList metadata once and apply to ALL files (batch mode)"""
         # In batch mode, all files should have the same metadata
         # So we can use any file to get the AniList link
-        sample_file = self.cbz_paths[0]
+        with self._cbz_paths_lock:
+            if not self.cbz_paths:
+                print("❌ Error: No CBZ files loaded")
+                return
+            sample_file = self.cbz_paths[0]
+            cbz_paths_copy = self.cbz_paths.copy()
         current_metadata = self.file_metadata.get(sample_file, {})
         web_links = current_metadata.get('Web', '')
         
         if not web_links:
-            messagebox.showerror("Error", "No web links found in metadata. Please fetch Mangabaka metadata first.")
+            print("Error: No web links found in metadata. Please fetch Mangabaka metadata first.")
             return
         
         # Extract AniList URL
@@ -3804,29 +4124,35 @@ class MetadataGUI(tk.Tk):
                 break
         
         if not anilist_url:
-            messagebox.showerror("Error", "No AniList link found in web links. Make sure Mangabaka metadata includes an AniList link.")
+            print("Error: No AniList link found in web links. Make sure Mangabaka metadata includes an AniList link.")
             return
         
         # Extract AniList ID
-        anilist_id = extract_anilist_id_from_url(anilist_url)
+        try:
+            anilist_id = extract_anilist_id_from_url(anilist_url)
+        except Exception as e:
+            print(f"Error: Could not extract AniList ID from URL '{anilist_url}': {str(e)}")
+            return
+        
         if not anilist_id:
-            messagebox.showerror("Error", f"Could not extract AniList ID from URL: {anilist_url}")
+            print(f"Error: Could not extract AniList ID from URL: {anilist_url}")
             return
         
         try:
             # Show progress
+            print(f"Fetching AniList metadata for ID: {anilist_id}...")
             self.update_idletasks()
             
             # Fetch AniList metadata ONCE
             anilist_metadata = fetch_anilist_metadata(anilist_id)
             
             if not anilist_metadata:
-                messagebox.showerror("Error", "Failed to fetch metadata from AniList")
+                print(f"Error: Failed to fetch metadata from AniList for ID: {anilist_id}")
                 return
             
             # Apply the SAME AniList metadata to ALL files
             files_updated = 0
-            for cbz_path in self.cbz_paths:
+            for cbz_path in cbz_paths_copy:
                 if cbz_path in self.file_metadata:
                     self.file_metadata[cbz_path].update(anilist_metadata)
                     files_updated += 1
@@ -3834,15 +4160,15 @@ class MetadataGUI(tk.Tk):
             # Refresh current display
             self.load_metadata(self.current_index)
             
-            # Show success message
+            # Log success message to console instead of popup
             updated_fields = [field for field, value in anilist_metadata.items() if value]
-            messagebox.showinfo("Success", 
-                              f"Successfully applied AniList metadata to {files_updated} files!\n\n"
-                              f"Updated fields: {', '.join(updated_fields)}")
+            print(f"Successfully applied AniList metadata to {files_updated} files!")
+            print(f"Updated fields: {', '.join(updated_fields)}")
                               
         except Exception as e:
             logging.error(f"Error in fetch_anilist_metadata_batch: {e}")
-            messagebox.showerror("Error", f"Failed to fetch AniList metadata: {str(e)}")
+            print(f"Failed to fetch AniList metadata: {str(e)}")
+
   
     def fetch_anilist_metadata_individual_all(self):
         """Fetch AniList metadata for each file individually (individual mode)"""
@@ -3863,13 +4189,13 @@ class MetadataGUI(tk.Tk):
             files_with_errors = []
             
             print(f"\n{'='*60}")
-            print(f"🔍 ANILIST METADATA FETCH STARTING")
+            print(f"ANILIST METADATA FETCH STARTING")
             print(f"{'='*60}")
             
             # Process each file
             for i, cbz_path in enumerate(self.cbz_paths):
                 filename = os.path.basename(cbz_path)
-                print(f"📁 Processing [{i+1}/{len(self.cbz_paths)}]: {filename}")
+                print(f"Processing [{i+1}/{len(self.cbz_paths)}]: {filename}")
                 
                 # Update progress (you might want to add a progress bar here)
                 self.update_idletasks()
@@ -3879,7 +4205,7 @@ class MetadataGUI(tk.Tk):
                 
                 if not web_links:
                     files_with_no_links.append(filename)
-                    print(f"   ❌ No web links found in metadata")
+                    print(f"No web links found in metadata")
                     continue
                 
                 # Extract AniList URL for this file
@@ -3892,7 +4218,7 @@ class MetadataGUI(tk.Tk):
                 
                 if not anilist_url:
                     files_with_no_links.append(filename)
-                    print(f"   ❌ No AniList link found in web links")
+                    print(f"No AniList link found in web links")
                     continue
                 
                 # Extract AniList ID
@@ -3900,18 +4226,18 @@ class MetadataGUI(tk.Tk):
                     anilist_id = extract_anilist_id_from_url(anilist_url)
                     if not anilist_id:
                         files_with_errors.append(filename)
-                        print(f"   ❌ Could not extract AniList ID from URL: {anilist_url}")
+                        print(f"Could not extract AniList ID from URL: {anilist_url}")
                         continue
                     
                     # Validate ID is numeric
                     if not str(anilist_id).isdigit():
                         files_with_errors.append(filename)
-                        print(f"   ❌ Invalid AniList ID format: '{anilist_id}' (must be numeric)")
+                        print(f"Invalid AniList ID format: '{anilist_id}' (must be numeric)")
                         continue
                         
                 except Exception as e:
                     files_with_errors.append(filename)
-                    print(f"   ❌ Error extracting AniList ID: {str(e)}")
+                    print(f"Error extracting AniList ID: {str(e)}")
                     continue
                 
                 # Fetch AniList metadata for this file
@@ -3922,40 +4248,40 @@ class MetadataGUI(tk.Tk):
                         current_metadata.update(anilist_metadata)
                         self.file_metadata[cbz_path] = current_metadata
                         files_updated += 1
-                        print(f"   ✅ Successfully fetched metadata (ID: {anilist_id})")
+                        print(f"Successfully fetched metadata (ID: {anilist_id})")
                     else:
                         files_with_errors.append(filename)
-                        print(f"   ❌ AniList API returned no data for ID: {anilist_id}")
+                        print(f"AniList API returned no data for ID: {anilist_id}")
                         
                 except Exception as e:
                     files_with_errors.append(filename)
-                    print(f"   ❌ AniList API error: {str(e)}")
+                    print(f"AniList API error: {str(e)}")
             
             # Print summary to console
             print(f"\n{'='*60}")
-            print(f"📊 ANILIST FETCH RESULTS SUMMARY")
+            print(f"ANILIST FETCH RESULTS SUMMARY")
             print(f"{'='*60}")
-            print(f"✅ Successfully updated: {files_updated}/{len(self.cbz_paths)} files")
+            print(f"Successfully updated: {files_updated}/{len(self.cbz_paths)} files")
             
             if files_with_no_links:
-                print(f"⚠️  No AniList links: {len(files_with_no_links)} files")
+                print(f"No AniList links: {len(files_with_no_links)} files")
                 for filename in files_with_no_links:
-                    print(f"   • {filename}")
+                    print(f"{filename}")
             
             if files_with_errors:
-                print(f"❌ Errors: {len(files_with_errors)} files")
+                print(f"Errors: {len(files_with_errors)} files")
                 for filename in files_with_errors:
-                    print(f"   • {filename}")
+                    print(f"{filename}")
             
             if files_with_no_links or files_with_errors:
-                print(f"\n💡 TROUBLESHOOTING TIPS:")
+                print(f"\nTROUBLESHOOTING TIPS:")
                 if files_with_no_links:
-                    print(f"   • Make sure to fetch Mangabaka metadata first")
-                    print(f"   • Check that the Mangabaka entries include AniList links")
+                    print(f"Make sure to fetch Mangabaka metadata first")
+                    print(f"Check that the Mangabaka entries include AniList links")
                 if files_with_errors:
-                    print(f"   • Check that AniList URLs are properly formatted")
-                    print(f"   • Verify the AniList manga IDs are valid")
-                    print(f"   • Some entries might not have AniList pages")
+                    print(f"Check that AniList URLs are properly formatted")
+                    print(f"Verify the AniList manga IDs are valid")
+                    print(f"Some entries might not have AniList pages")
             
             print(f"{'='*60}\n")
             
@@ -3964,12 +4290,12 @@ class MetadataGUI(tk.Tk):
             
             # Show simple success message
             if files_updated > 0:
-                messagebox.showinfo("AniList Fetch Complete", 
-                                  f"✅ Successfully updated {files_updated}/{len(self.cbz_paths)} files!\n\n"
+                print("AniList Fetch Complete", 
+                                  f"Successfully updated {files_updated}/{len(self.cbz_paths)} files!\n\n"
                                   f"Check console for detailed results.")
             else:
                 messagebox.showwarning("AniList Fetch Complete", 
-                                     f"❌ No files were updated.\n\n"
+                                     f"No files were updated.\n\n"
                                      f"Check console for detailed error information.")
             
         except Exception as e:
@@ -3992,7 +4318,9 @@ class MetadataGUI(tk.Tk):
         mode = self.metadata_mode.get()
     
         if mode == "batch":
-            for cbz_path in self.cbz_paths:
+            with self._cbz_paths_lock:
+                cbz_paths_copy = self.cbz_paths.copy()
+            for cbz_path in cbz_paths_copy:
                 volume = extract_volume_from_filename(os.path.basename(cbz_path))
                 if volume:
                     selected_metadata["Volume"] = volume
@@ -4014,9 +4342,11 @@ class MetadataGUI(tk.Tk):
         
     def insert_metadata(self):
         """Insert metadata into all CBZ files - parallel processing version"""
-        if not self.cbz_paths:
-            messagebox.showerror("Error", "No CBZ files loaded")
-            return
+        with self._cbz_paths_lock:
+            if not self.cbz_paths:
+                messagebox.showerror("Error", "No CBZ files loaded")
+                return
+            total_files = len(self.cbz_paths)
         
         # Get thread count (use saved preference or show dialog)
         if not hasattr(self, '_saved_thread_count'):
@@ -4027,17 +4357,21 @@ class MetadataGUI(tk.Tk):
         else:
             thread_count = self._saved_thread_count
         
-        # Confirm action with parallel processing info
-        result = messagebox.askyesno(
-            "Confirm Metadata Insertion", 
-            f"Insert metadata into {len(self.cbz_paths)} CBZ files?\n\n"
-            "This will modify the files and cannot be undone.\n\n"
-            f"Using {thread_count} parallel threads for processing.\n\n"
-            "(Right-click Insert Metadata into All CBZs button to change thread count)"
-        )
-        if not result:
-            return
-            
+        # Only show confirmation dialog if not previously confirmed
+        if not hasattr(self, '_skip_confirmation') or not self._skip_confirmation:
+            result = messagebox.askyesno(
+                "Confirm Metadata Insertion", 
+                f"Insert metadata into {len(self.cbz_paths)} CBZ files?\n\n"
+                "This will modify the files and cannot be undone.\n\n"
+                f"Using {thread_count} parallel threads for processing.\n\n"
+                "(Right-click Insert Metadata into All CBZs button to change thread count)\n\n"
+                "Click Yes to proceed and skip this confirmation in the future."
+            )
+            if not result:
+                return
+            # Save the preference to skip future confirmations
+            self._skip_confirmation = True
+        
         # Save current form data
         self.save_current_metadata()
         
@@ -4206,10 +4540,10 @@ class MetadataGUI(tk.Tk):
                            relief='flat')
         tips_text.pack(fill='x')
         tips_text.insert('1.0', 
-            "• More threads = faster processing for multiple files\n"
-            "• Too many threads may cause system slowdown\n"
-            "• For SSDs: 8-16 threads usually optimal\n"
-            "• For HDDs: 2-4 threads recommended")
+            "More threads = faster processing for multiple files\n"
+            "Too many threads may cause system slowdown\n"
+            "For SSDs: 8-16 threads usually optimal\n"
+            "For HDDs: 2-4 threads recommended")
         tips_text.config(state='disabled')
         
         # Buttons
@@ -4469,22 +4803,22 @@ class MetadataGUI(tk.Tk):
                             f"Errors in {len(error_files)} files:\n{error_display}")
                 messagebox.showwarning("Partial Success", error_msg)
         else:
-            messagebox.showinfo("Success", 
-                               f"✅ Successfully inserted metadata into all {success_count} CBZ files "
+            print("Success", 
+                               f"Successfully inserted metadata into all {success_count} CBZ files "
                                f"using {getattr(self, '_max_workers', 1)} parallel threads!")
     
     def _handle_insertion_cancelled(self, success_count, error_files):
         """Handle user cancellation (called on main thread)"""
         self._hide_insertion_progress()
         messagebox.showinfo("Operation Cancelled", 
-                           f"❌ Operation cancelled by user.\n\n"
+                           f"Operation cancelled by user.\n\n"
                            f"Successfully processed {success_count} files before cancellation.")
     
     def _handle_insertion_error(self, error_msg, success_count):
         """Handle critical error (called on main thread)"""
         self._hide_insertion_progress()
         messagebox.showerror("Critical Error", 
-                            f"💥 Critical error occurred:\n{error_msg}\n\n"
+                            f"Critical error occurred:\n{error_msg}\n\n"
                             f"Successfully processed {success_count} files before error.")
     
     def _show_detailed_results(self, success_count, total_files, error_files):
@@ -4497,7 +4831,7 @@ class MetadataGUI(tk.Tk):
         # Summary
         summary_text = f"Processed {success_count}/{total_files} files successfully"
         if error_files:
-            summary_text += f" • {len(error_files)} errors"
+            summary_text += f"{len(error_files)} errors"
         
         ttk.Label(result_window, text=summary_text, font=('TkDefaultFont', 10, 'bold')).pack(pady=10)
         
@@ -4517,7 +4851,7 @@ class MetadataGUI(tk.Tk):
             
             # Insert error details
             for error in error_files:
-                text_widget.insert('end', f"• {error}\n")
+                text_widget.insert('end', f" {error}\n")
             
             text_widget.configure(state='disabled')  # Make read-only
         
@@ -4584,10 +4918,39 @@ class MetadataGUI(tk.Tk):
             self._update_file_listbox_indicators()
         
         if updated_count > 0:
-            messagebox.showinfo("Volume Info", f"Updated volume information for {updated_count} files")
+            print("Volume Info", f"Updated volume information for {updated_count} files")
         else:
-            messagebox.showinfo("Volume Info", "No volume information could be extracted from filenames")
+            print("Volume Info", "No volume information could be extracted from filenames")
 
+
+
+    def fill_chapter_info(self):
+        """Auto-fill chapter/issue number information for all files"""
+        if not self.cbz_paths:
+            return
+            
+        updated_count = 0
+        for cbz_path in self.cbz_paths:
+            chapter = extract_chapter_from_filename(os.path.basename(cbz_path))
+            if chapter:
+                # Ensure the file has metadata dict
+                if cbz_path not in self.file_metadata:
+                    self.file_metadata[cbz_path] = {field: "" for field in self.fields}
+                
+                self.file_metadata[cbz_path]["Number"] = chapter
+                updated_count += 1
+        
+        # Refresh current display AND update file indicators
+        self.load_metadata(self.current_index)
+        
+        # Update file listbox indicators if in individual mode  
+        if hasattr(self, '_update_file_listbox_indicators'):
+            self._update_file_listbox_indicators()
+        
+        if updated_count > 0:
+            print("Chapter Info", f"Updated chapter/issue numbers for {updated_count} files")
+        else:
+            print("Chapter Info", "No chapter/issue numbers could be extracted from filenames")
 
     def fill_page_count(self):
         """Count and fill page count for all files"""
@@ -4628,10 +4991,9 @@ class MetadataGUI(tk.Tk):
                     "\n".join(failed_files[:5]) + 
                     (f"\n... and {len(failed_files) - 5} more" if len(failed_files) > 5 else ""))
             else:
-                messagebox.showinfo("Page Count", f"Successfully updated page count for all {updated_count} files!")
+                print("Page Count", f"Successfully updated page count for all {updated_count} files!")
         else:
-            messagebox.showwarning("Page Count", "Could not count pages for any files")
-
+            print("Page Count", "Could not count pages for any files")
 
 
 if __name__ == '__main__':
