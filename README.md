@@ -16,6 +16,7 @@ Built with Tkinter, this tool streamlines the process of organizing large manga 
 
 ---
 <img width="2560" height="1387" alt="image" src="https://github.com/user-attachments/assets/4f7679c2-c53f-4e62-b2e4-9f9a7e2c6b4a" />
+<img width="2531" height="1377" alt="image" src="https://github.com/user-attachments/assets/f1c6cc23-278b-4f96-80dc-d0a6c8eb4b7e" />
 
 ## ⚙️ Requirements & Installation
 
