@@ -15,6 +15,7 @@ Built with Tkinter, this tool streamlines the process of organizing large manga 
 - **Folder Toggle:** By Checking "Use Folder Name for Search" allows the script to use the parent folder's name (e.g., `One Piece/Chapter 1.cbz` -> searches for "One Piece" instead of "Chapter 1"). Clicking any file in the listbox dynamically updates the search bar to that file's specific title.
 
 ---
+<img width="2560" height="1387" alt="image" src="https://github.com/user-attachments/assets/4f7679c2-c53f-4e62-b2e4-9f9a7e2c6b4a" />
 
 ## ⚙️ Requirements & Installation
 
