@@ -5,6 +5,7 @@
 # Requires-Dist: tkinterdnd2
 
 import os
+import html
 import zipfile
 import xml.etree.ElementTree as ET
 import tkinter as tk
@@ -30,6 +31,115 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Thread, Lock
 
+# ==============================================================================
+# USER CONFIGURABLE SETTINGS
+# ==============================================================================
+
+# Maximum number of threads for bulk metadata insertion. (e.g., 4, 8, 16)
+# Set to None to let Python auto-calculate based on your CPU.
+MAX_WORKER_THREADS = None 
+
+# Web domains to filter out of the "Web" links field
+WEB_LINK_BLACKLIST = ['amazon.co.jp', 'ja.wikipedia.org']
+
+# Allowed languages for the LocalizedSeries field
+ALLOWED_LOCALIZED_LANGUAGES = {"en", "zh", "ja", "ko", "zh-Latn", "ko-Latn", "ja-Latn", "fr", "mr"}
+
+# Title extraction priority for the main 'Series' name (Mangabaka API v2 format)
+# The script will try these rules from top to bottom.
+SERIES_TITLE_PRIORITY = [
+    {"lang": "en", "trait": "official", "is_primary": True},
+    {"lang": "en", "trait": "alternative", "is_primary": True},
+    {"lang": "en", "trait": None, "is_primary": True},
+    {"lang": "ja-Latn", "trait": None, "is_primary": True},
+    {"lang": "ko-Latn", "trait": None, "is_primary": True},
+    {"lang": "zh-Latn", "trait": None, "is_primary": True},
+]
+
+# Publisher language preference for the main Publisher field
+PREFERRED_PUBLISHER_TYPES = ['english', 'en']
+
+# Age Rating mapping from Mangabaka content_rating
+AGE_RATING_MAPPING = {
+    "safe": "Everyone",
+    "suggestive": "Teen", 
+    "erotica": "Mature 17+",
+    "pornographic": "Adults Only 18+"
+}
+
+# AniList Character & Staff Parsing Rules
+ANILIST_CHARACTER_ROLES = ['MAIN', 'SUPPORTING', 'BACKGROUND']
+
+ANILIST_STAFF_ROLE_MAPPINGS = {
+    'story': 'Writer', 'story & art': 'Writer', 'original creator': 'Writer',
+    'original story': 'Writer', 'author': 'Writer', 'writer': 'Writer',
+    'artist': 'Penciller', 'illustrator': 'Penciller',
+    'inking': 'Inker', 'color': 'Colorist', 'coloring': 'Colorist',
+    'lettering (english)': 'Letterer', 'touch-up art & lettering (english)': 'Letterer',
+    'cover': 'CoverArtist', 'cover art': 'CoverArtist',
+    'assistant': 'CoverArtist', 'assistant (former)': 'CoverArtist', 'assistant (Former)': 'CoverArtist',
+    'editor': 'Editor', 'editorial': 'Editor',
+    'translation': 'Translator', 'translator (english)': 'Translator'
+}
+
+ANILIST_STAFF_REGEX_MAPPINGS = [
+    (r'touch-up art & lettering.*', 'Letterer'),
+    (r'^translator \(english.*', 'Translator'),
+    (r'editing \(.*\)', 'Editor')
+]
+
+ANILIST_ART_ROLES = ['character design', 'art', 'story & art']
+
+# The exact ComicInfo.xml fields supported by the GUI (Order matters for UI layout)
+METADATA_FIELDS = [
+    "Title", "Series", "LocalizedSeries", "AgeRating", "Number", "Count", "Volume", 
+    "PageCount", "Summary", "Year", "Month", "Day", "Writer", "Penciller", "Inker", 
+    "Colorist", "Letterer", "CoverArtist", "Editor", "Translator", "Publisher", 
+    "Imprint", "GTIN", "Genre", "Tags", "LanguageISO", "Web", "Notes", "Format", "Characters", 
+    "CommunityRating", "Review", "AlternateSeries", "AlternateNumber", "AlternateCount", 
+    "Teams", "Locations", "ScanInformation", "StoryArc", "StoryArcNumber", "SeriesGroup", 
+    "MainCharacterOrTeam"
+]
+
+# UI Tooltips for the metadata fields
+FIELD_TOOLTIPS = {
+    "Title": "The title of this specific issue or volume (e.g., 'Attack on Titan #1')",
+    "Series": "The name of the manga/comic series (e.g., 'Attack on Titan')",
+    "LocalizedSeries": "Series name in local language or alternate region name",
+    "Number": "Issue number within the series (e.g., 1, 2, 3.5)",
+    "Count": "Total number of issues in the series (if known)",
+    "Volume": "Volume number for collected editions or multi-volume series",
+    "Summary": "Brief description or synopsis of this issue's content",
+    "Year": "Publication year (YYYY format)",
+    "Month": "Publication month (1-12)",
+    "Day": "Publication day (1-31)",
+    "LanguageISO": "Language code (e.g., 'en' for English, 'ja' for Japanese)",
+    "Web": "Related website URL or online resource",
+    "PageCount": "Total number of pages in this issue",
+    "Format": "Publication format (e.g., 'TPB', 'One-Shot', 'Annual')",
+    "Characters": "Characters featured - separate with commas",
+    "SeriesGroup": "Group or Collection this series belongs to",
+    "AgeRating": "Content rating indicating appropriate age group"
+}
+
+# Dropdown choices for the AgeRating field
+AGE_RATING_OPTIONS = [
+    "Unknown", "Rating Pending", "Early Childhood", "Everyone", "G", "Everyone 10+", 
+    "PG", "Kids to Adults", "Teen", "MA15+", "Mature 17+", "M", "R18+", 
+    "Adults Only 18+", "X18+"
+]
+
+# Dropdown choices for the Format field
+FORMAT_OPTIONS = [
+    "Special", "Reference", "Director's Cut", "Box Set", "Box-Set", "Annual", 
+    "Anthology", "Epilogue", "One Shot", "One-Shot", "Prologue", "TPB", 
+    "Trade Paper Back", "Omnibus", "Compendium", "Absolute", "Graphic Novel", 
+    "GN", "FCBD"
+]
+
+# ==============================================================================
+# PATTERNS
+# ==============================================================================
 
 # External source URL patterns
 SOURCE_URL_PATTERNS = {
@@ -42,9 +152,19 @@ SOURCE_URL_PATTERNS = {
     "anime_news_network": "https://www.animenewsnetwork.com/encyclopedia/manga.php?id="
 }
 
-# Pre-compiled patterns
-VOLUME_PATTERN = re.compile(r'v(?:ol)?\.?\s*(\d+)', re.IGNORECASE)
-CHAPTER_PATTERN = re.compile(r'\bc(?:h(?:ap(?:ter)?)?)?\.?\s*(\d+)', re.IGNORECASE)
+APOSTROPHE_MAP = str.maketrans({
+    "\u2018": "'",  # ‘
+    "\u2019": "'",  # ’
+    "\u201B": "'",  # ‛
+    "\u02BC": "'",  # ʼ
+    "\uFF07": "'",  # ＇
+    "`": "'",       # `
+    "´": "'",       # ´
+})
+
+# Pre-compiled Regex and Function Patterns
+VOLUME_PATTERN = re.compile(r'v(?:ol)?\.?\s*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)', re.IGNORECASE)
+CHAPTER_PATTERN = re.compile(r'\bc(?:h(?:ap(?:ter)?)?)?\.?\s*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)', re.IGNORECASE)
 HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
 WHITESPACE_PATTERN = re.compile(r'\s+')
 NEWLINE_CLEANUP_PATTERN = re.compile(r'\n\s*\n\s*\n+')
@@ -53,12 +173,31 @@ BRACKET_CONTENT_PATTERN = re.compile(r'\[([^\]]+)\]')
 PAREN_CONTENT_PATTERN = re.compile(r'\(([^)]+)\)')
 SPECIAL_CHARS_PATTERN = re.compile(r'[^a-zA-Z0-9\s]')
 ANILIST_ID_PATTERN = re.compile(r'anilist\.co/manga/(\d+)', re.IGNORECASE)
-REVERSED_VOLUME_PATTERN = re.compile(r'(\d+)(?:st|nd|rd|th)?\s*(?:vol|volume)', re.IGNORECASE)
-VOLUME_START_PATTERN = re.compile(r'^(?:volume|vol)\.?\s*(\d+)', re.IGNORECASE)
-STANDALONE_V_PATTERN = re.compile(r'\bv\.?\s*0*(\d+)\b', re.IGNORECASE)
+REVERSED_VOLUME_PATTERN = re.compile(r'(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)(?:st|nd|rd|th)?\s*(?:vol|volume)', re.IGNORECASE)
+VOLUME_START_PATTERN = re.compile(r'^(?:volume|vol)\.?\s*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)', re.IGNORECASE)
+STANDALONE_V_PATTERN = re.compile(r'\bv\.?\s*0*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)\b', re.IGNORECASE)
 SEPARATOR_PATTERN = re.compile(r'[_\-]+')
 EXTENSION_PATTERN = re.compile(r'\.(cbz|cbr|zip|rar|pdf)$', re.IGNORECASE)
-
+TITLE_FALLBACK_PATTERN = re.compile(r'\b(?:v|vol|volume)\.?\s*-?\s*\d+(?:\.\d+)?', re.IGNORECASE)
+ANILIST_URL_PATTERN = re.compile(r'anilist\.co/manga/(\d+)')
+TITLE_CLEANUP_PATTERNS = [
+    re.compile(r'^(.*?)\s*v?ol?\.?\s*\d+(?:\.\d+)?', re.IGNORECASE),     # V01, Vol01, Vol. 1, Vol 1.5, Vol 1.25
+    re.compile(r'^(.*?)\s*volume\.?\s*\d+(?:\.\d+)?', re.IGNORECASE),    # Volume 1, Volume 1.5
+    re.compile(r'^(.*?)\s*ch?apter?\.?\s*\d+(?:\.\d+)?', re.IGNORECASE), # ch01, chapter 1, ch98.5, ch92.17
+    re.compile(r'^(.*?)\s*v\.?\s*\d+', re.IGNORECASE),                   # v01
+    # NEW: Handle combined Season/Side Story + Chapter with multi-decimal support (S01 C07.5, SS C15.17)
+    re.compile(r'^(.*?)\s+(?:S\d+|SS\d*)\s+C\d+(?:\.\d+)?', re.IGNORECASE),
+    # NEW: Handle standalone Season or Side Story markers (S01, SS, SS2)
+    re.compile(r'^(.*?)\s+(?:S\d+|SS\d*)(?:\s|$|\-)', re.IGNORECASE),
+    # NEW: Handle standalone Chapter markers WITH multi-decimal support (C001, C07.5, C92.17)
+    re.compile(r'^(.*?)\s+C\d+(?:\.\d+)?', re.IGNORECASE),
+    re.compile(r'^(.*?)\s*\d{4}', re.IGNORECASE),                        # year fallback
+]
+TRAILING_HYPHEN_PATTERN = re.compile(r'[\s\-]+$')
+BRACKET_REMOVAL_PATTERN = re.compile(r'\s*\(.*?\)|\[.*?\]')
+SCANLATOR_REMOVAL_PATTERN = re.compile(r'\s+(Digital|LuCaZ|1r0n|.*?Scan).*$', re.IGNORECASE)
+SPECIAL_CHARS_REMOVAL = re.compile(r'[^\w\s]')
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.avif', '.jxl', '.gif', '.bmp'}
 
 _API_SESSION = None
 _SESSION_LOCK = Lock()
@@ -122,7 +261,6 @@ def init_database():
     conn.close()
 
 def is_valid_source_id(source_id, source_name):
-    """Validate source IDs before constructing URLs"""
     if source_id is None or str(source_id).strip() in ['', 'null', 'None', '0']:
         return False
     
@@ -138,12 +276,9 @@ def is_valid_source_id(source_id, source_name):
 
 
 def center_window(window, width=None, height=None):
-    """Center a window on the screen"""
-    # Force the window to update its geometry
     window.update_idletasks()
     window.update()
     
-    # Get window dimensions
     if width and height:
         window_width = width
         window_height = height
@@ -151,21 +286,17 @@ def center_window(window, width=None, height=None):
         window_width = window.winfo_reqwidth()
         window_height = window.winfo_reqheight()
         
-        # Fallback to specified dimensions if required dimensions are too small
         if window_width < 100:
             window_width = width or 400
         if window_height < 100:
             window_height = height or 300
     
-    # Get screen dimensions
     screen_width = window.winfo_screenwidth()
     screen_height = window.winfo_screenheight()
     
-    # Calculate position
     x = (screen_width - window_width) // 2
     y = (screen_height - window_height) // 2
     
-    # Ensure window doesn't go off screen
     x = max(0, x)
     y = max(0, y)
     
@@ -200,11 +331,9 @@ class ToolTip:
             self.widget.after_cancel(id)
     
     def showtip(self, event=None):
-        # Get widget position relative to screen
         x = self.widget.winfo_rootx() + 25
         y = self.widget.winfo_rooty() + 20
         
-        # Creates a toplevel window
         self.tipwindow = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry("+%d+%d" % (x, y))
@@ -219,35 +348,45 @@ class ToolTip:
         if tw:
             tw.destroy()
             
+# ==============================================================================
+# SERIES DATABASE DIALOG
+# ==============================================================================
 
 class SeriesDatabase:
-    """Class to handle series metadata database operations"""
+    """Class to handle series metadata database operations using a persistent connection"""
     
     def __init__(self, db_path="series.db"):
         self.db_path = db_path
+        # Create a single, persistent connection. check_same_thread=False allows background workers
+        # (like the auto-match threaded functions) to safely query the database.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # Enable write-ahead logging (WAL) mode for better concurrent read/write performance
+        self.conn.execute('PRAGMA journal_mode=WAL')
         self.init_database()
     
+    def __del__(self):
+        """Ensure connection is closed when the object is destroyed"""
+        if hasattr(self, 'conn'):
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
     def _normalize_series_name(self, series_name):
         """Remove decimal numbers from series name (e.g., '2.5' but keep '7th', 'Lv. 9999')"""
         if not series_name:
             return series_name
         
-        # Remove standalone decimal numbers (e.g., 2.5, 3.14)
-        # This pattern matches: word boundary + digits + decimal point + digits + word boundary
         normalized = re.sub(r'\b\d+\.\d+\b\s*', '', series_name)
-        
-        # Clean up any extra spaces that may result
-        normalized = WHITESPACE_PATTERN.sub( ' ', normalized).strip()
+        normalized = WHITESPACE_PATTERN.sub(' ', normalized).strip()
         
         return normalized
     
     def init_database(self):
         """Initialize the database with required tables"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         try:
-            # Create series_metadata table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS series_metadata (
                     series_name TEXT PRIMARY KEY,
@@ -256,7 +395,6 @@ class SeriesDatabase:
                 )
             ''')
             
-            # Create series_aliases table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS series_aliases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,27 +405,22 @@ class SeriesDatabase:
                 )
             ''')
             
-            conn.commit()
+            self.conn.commit()
         except Exception as e:
             logging.error(f"Error initializing database: {e}")
-        finally:
-            conn.close()
     
     def save_series_metadata(self, series_name, metadata):
         """Save or update series metadata in the database"""
         if not series_name or not series_name.strip():
             raise ValueError("Series name cannot be empty")
         
-        # Normalize the series name to remove decimal numbers
         series_name = self._normalize_series_name(series_name.strip())
         
         if not series_name:
             raise ValueError("Series name cannot be empty after normalization")
         
         metadata_json = json.dumps(metadata, ensure_ascii=False, indent=2)
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         try:
             cursor.execute('''
@@ -296,13 +429,11 @@ class SeriesDatabase:
                 VALUES (?, ?, ?)
             ''', (series_name, metadata_json, datetime.now().isoformat()))
             
-            conn.commit()
+            self.conn.commit()
             return True
         except Exception as e:
             logging.error(f"Error saving series metadata: {e}")
             return False
-        finally:
-            conn.close()
     
     def load_series_metadata(self, series_name):
         """Load series metadata from the database"""
@@ -310,8 +441,7 @@ class SeriesDatabase:
             return None
         
         series_name = series_name.strip()
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         try:
             cursor.execute(
@@ -326,43 +456,22 @@ class SeriesDatabase:
         except Exception as e:
             logging.error(f"Error loading series metadata: {e}")
             return None
-        finally:
-            conn.close()
-    
-    def get_all_series(self):
-        """Get all series names from the database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
-                'SELECT series_name, updated_at FROM series_metadata ORDER BY updated_at DESC'
-            )
-            return [(row[0], row[1]) for row in cursor.fetchall()]
-        except Exception as e:
-            logging.error(f"Error getting all series: {e}")
-            return []
-        finally:
-            conn.close()
-    
+       
     def delete_series(self, series_name):
         """Delete a series from the database (aliases are deleted automatically via CASCADE)"""
         if not series_name or not series_name.strip():
             return False
         
         series_name = series_name.strip()
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         try:
             cursor.execute('DELETE FROM series_metadata WHERE series_name = ?', (series_name,))
-            conn.commit()
+            self.conn.commit()
             return cursor.rowcount > 0
         except Exception as e:
             logging.error(f"Error deleting series metadata: {e}")
             return False
-        finally:
-            conn.close()
     
     def search_series(self, search_term):
         """Search for series by name (case-insensitive partial match)"""
@@ -370,8 +479,7 @@ class SeriesDatabase:
             return []
         
         search_term = f"%{search_term.strip()}%"
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         try:
             cursor.execute(
@@ -382,8 +490,6 @@ class SeriesDatabase:
         except Exception as e:
             logging.error(f"Error searching series: {e}")
             return []
-        finally:
-            conn.close()
     
     def save_series_aliases(self, series_name, aliases):
         """Save aliases for a series (replaces all existing aliases)"""
@@ -391,14 +497,11 @@ class SeriesDatabase:
             raise ValueError("Series name cannot be empty")
         
         series_name = series_name.strip()
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         try:
-            # Delete existing aliases
             cursor.execute('DELETE FROM series_aliases WHERE series_name = ?', (series_name,))
             
-            # Insert new aliases
             if aliases:
                 alias_data = [(series_name, alias.strip()) for alias in aliases if alias.strip()]
                 cursor.executemany(
@@ -406,13 +509,11 @@ class SeriesDatabase:
                     alias_data
                 )
             
-            conn.commit()
+            self.conn.commit()
             return True
         except Exception as e:
             logging.error(f"Error saving series aliases: {e}")
             return False
-        finally:
-            conn.close()
     
     def load_series_aliases(self, series_name):
         """Load aliases for a series"""
@@ -420,8 +521,7 @@ class SeriesDatabase:
             return []
         
         series_name = series_name.strip()
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         try:
             cursor.execute(
@@ -432,13 +532,10 @@ class SeriesDatabase:
         except Exception as e:
             logging.error(f"Error loading series aliases: {e}")
             return []
-        finally:
-            conn.close()
     
     def get_all_series_with_aliases(self):
         """Get all series with their aliases for matching"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
 
         try:
             cursor.execute('''
@@ -463,17 +560,13 @@ class SeriesDatabase:
             logging.error(f"Error getting series with aliases: {e}")
             return []
 
-        finally:
-            conn.close()
-
 
 # ==============================================================================
-# 4. ALIAS EDITOR DIALOG
+# ALIAS EDITOR DIALOG
 # ==============================================================================
 
 
 class AliasEditorDialog(tk.Toplevel):
-    """Dialog for editing series aliases"""
     
     def __init__(self, parent, series_name, current_aliases=None):
         super().__init__(parent)
@@ -489,7 +582,6 @@ class AliasEditorDialog(tk.Toplevel):
         self.create_widgets()
         self.populate_aliases()
         
-        # Center the dialog LAST
         self.geometry("500x400")
         self.update_idletasks()
         center_window(self, 500, 400)
@@ -499,16 +591,13 @@ class AliasEditorDialog(tk.Toplevel):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill='both', expand=True)
         
-        # Info label
         info_label = ttk.Label(main_frame, text=f"Series: {self.series_name}")
         info_label.pack(anchor='w', pady=(0, 10))
         ToolTip(info_label, f"Editing aliases for the series: {self.series_name}")
         
-        # Aliases frame
         aliases_frame = ttk.LabelFrame(main_frame, text="Aliases (one per line)", padding=5)
         aliases_frame.pack(fill='both', expand=True, pady=(0, 10))
         
-        # Text widget for aliases
         self.aliases_text = tk.Text(aliases_frame, height=15, width=50)
         scrollbar = ttk.Scrollbar(aliases_frame, orient='vertical', command=self.aliases_text.yview)
         self.aliases_text.configure(yscrollcommand=scrollbar.set)
@@ -517,7 +606,6 @@ class AliasEditorDialog(tk.Toplevel):
         scrollbar.pack(side='right', fill='y')
         ToolTip(self.aliases_text, "Enter alternative names for this series, one per line.\nThese will be used for automatic file matching.")
         
-        # Button frame
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill='x')
         
@@ -530,84 +618,52 @@ class AliasEditorDialog(tk.Toplevel):
         ToolTip(cancel_btn, "Cancel editing and close the dialog without saving")
 
     def populate_aliases(self):
-        """Populate the text widget with current aliases"""
         if self.aliases:
             self.aliases_text.insert('1.0', '\n'.join(self.aliases))
 
     def save_aliases(self):
-        """Save the aliases and close dialog"""
         content = self.aliases_text.get('1.0', 'end-1c')
         self.result = [line.strip() for line in content.split('\n') if line.strip()]
         self.destroy()
 
     def cancel(self):
-        """Cancel and close dialog"""
         self.result = None
         self.destroy()
 
-# Initialize database
 series_db = SeriesDatabase()
 
 local_dump = []
 if os.path.exists(DUMP_PATH):
+    logging.info("Building lightweight memory index from dump...")
     try:
-        with open(DUMP_PATH, 'r', encoding='utf-8') as f:
-            local_dump = [json.loads(line) for line in f if line.strip()]
+        # Open in binary mode ('rb') to perfectly track exact file byte offsets
+        with open(DUMP_PATH, 'rb') as f:
+            offset = 0
+            for line in f:
+                if not line.strip():
+                    offset += len(line)
+                    continue
+                
+                raw = json.loads(line.decode('utf-8'))
+                
+                # Store ONLY what the fuzzy matcher needs + the file offset
+                slim_entry = {
+                    "id": raw.get("id"),
+                    "state": raw.get("state"),
+                    "merged_with": raw.get("merged_with"),
+                    "title": raw.get("title"),
+                    "native_title": raw.get("native_title"),
+                    "romanized_title": raw.get("romanized_title"),
+                    "secondary_titles": raw.get("secondary_titles"),
+                    "_offset": offset  # <-- The magic key to find this data later
+                }
+                local_dump.append(slim_entry)
+                offset += len(line)
+                
+        logging.info(f"Loaded {len(local_dump)} series into lightweight index.")
     except Exception as e:
         logging.error(f"Failed to load local dump: {e}")
-
-if os.path.exists(CACHE_PATH):
-    try:
-        with open(CACHE_PATH, 'r', encoding='utf-8') as f:
-            api_cache = json.load(f)
-    except Exception as e:
-        logging.error(f"Failed to load API cache: {e}")
-        api_cache = {}
-else:
-    api_cache = {}
-
-def is_url(text):
-    return text.strip().lower().startswith(("http://", "https://"))
-    
-def get_metadata_from_direct_url(url):
-    try:
-        parsed = urlparse(url)
-        if "mangabaka.dev" not in parsed.netloc:
-            return []
-
-        # Extract first numeric segment from the path
-        path_parts = parsed.path.strip("/").split("/")
-        entry_id = next((part for part in path_parts if part.isdigit()), None)
-
-        if not entry_id:
-            logging.warning(f"No entry ID found in Mangabaka URL: {url}")
-            return []
-
-        # Call Mangabaka entry endpoint
-        response = get_api_session().get(
-            f"https://mangabaka.dev/api/entry?id={entry_id}",
-            timeout=10,
-            headers={'User-Agent': 'CBZ-Metadata-Tool/1.0'}
-        )
-        response.raise_for_status()
-
-        entry = response.json()
-        if isinstance(entry, dict):
-            return [MetadataGUI.extract_metadata(entry)]
-
-    except Exception as e:
-        logging.error(f"Direct URL fetch failed: {e}")
-
-    return []
-    
-def save_api_cache():
-    try:
-        with open(CACHE_PATH, 'w', encoding='utf-8') as f:
-            json.dump(api_cache, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logging.error(f"Failed to save API cache: {e}")
-
-@lru_cache(maxsize=1000) 
+ 
 def normalize_romaji_cached(text, cache={}):
     """Normalize romaji with caching for performance - IMPROVED VERSION"""
     if not text or text in cache:
@@ -616,7 +672,8 @@ def normalize_romaji_cached(text, cache={}):
     original_text = text
     text = text.lower()
     
-    # Handle macrons - more comprehensive mapping
+    text = text.translate(APOSTROPHE_MAP)
+    
     macron_map = {
         'Ã„Â': 'aa', 'Ã„Â«': 'ii', 'Ã…Â«': 'uu', 'Ã„â€œ': 'ee', 'Ã…Â': 'ou',
         'ÃƒÂ¢': 'aa', 'ÃƒÂª': 'ee', 'ÃƒÂ®': 'ii', 'ÃƒÂ´': 'ou', 'ÃƒÂ»': 'uu',
@@ -626,18 +683,12 @@ def normalize_romaji_cached(text, cache={}):
     for k, v in macron_map.items():
         text = text.replace(k, v)
     
-    # Unicode normalization
     text = unicodedata.normalize("NFKD", text)
     text = ''.join(c for c in text if not unicodedata.combining(c))
-    
-    # LESS aggressive cleanup - preserve more characters that might be important
-    # Replace various dashes with spaces but keep other punctuation for now
-    text = text.replace("Ã¢â‚¬â€œ", " ").replace("Ã¢â‚¬â€", " ").replace("-", " ")
-    
-    # Remove only clearly problematic symbols, keep more punctuation
+    text = text.replace("–", " ").replace("—", " ").replace("-", " ")
     text = re.sub(r"[^\w\s'.!?:;]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
-    
+
     cache[original_text] = text
     return text
 
@@ -663,197 +714,15 @@ def resolve_merged_entry(entry_id, merge_map):
     original_id = entry_id
     visited = set()
     
-    # Follow the merge chain to the end
     while entry_id in merge_map and entry_id not in visited:
         visited.add(entry_id)
         entry_id = merge_map[entry_id]
         
-        # Prevent infinite loops
         if len(visited) > 10:
             logging.warning(f"Merge chain too long for ID {original_id}, stopping at {entry_id}")
             break
     
     return entry_id
-
-def filter_merged_entries(entries, merge_map):
-    """Filter out merged entries and resolve to final targets"""
-    seen_final_ids = set()
-    filtered_entries = []
-    
-    for entry in entries:
-        entry_id = entry.get("id")
-        state = entry.get("state", "").lower()
-        
-        # Skip if this is a merged entry
-        if state == "merged":
-            continue
-        
-        # Resolve any merges that might point to this entry
-        final_id = resolve_merged_entry(entry_id, merge_map)
-        
-        # Only include if we haven't seen this final ID before
-        if final_id not in seen_final_ids:
-            seen_final_ids.add(final_id)
-            
-            # If the final_id is different from current entry_id,
-            # we need to find the actual target entry
-            if final_id != entry_id:
-                # Find the target entry in the dump
-                target_entry = next((e for e in local_dump if e.get("id") == final_id), None)
-                if target_entry:
-                    filtered_entries.append(target_entry)
-                else:
-                    logging.warning(f"Target entry {final_id} not found for merged entry {entry_id}")
-            else:
-                filtered_entries.append(entry)
-    
-    return filtered_entries
-
-def find_best_match_merge_aware(title):
-    """IMPROVED: Optimized search that handles merged entries properly"""
-    if not local_dump:
-        return []
-    
-    search_term = title.strip()
-    if not search_term:
-        return []
-    
-    # Build merge map once (you might want to cache this globally)
-    merge_map, active_ids = build_merge_map(local_dump)
-    
-    # Pre-normalize search term once
-    search_term_norm = normalize_romaji_cached(search_term)
-    search_words = set(search_term_norm.split())
-    search_len = len(search_term_norm)
-    
-    matches = []
-    processed_final_ids = set()  # Track final IDs to avoid duplicates
-    
-    for entry in local_dump:
-        entry_id = entry.get("id")
-        state = entry.get("state", "").lower()
-        
-        # Skip merged entries entirely - they're obsolete
-        if state == "merged":
-            continue
-        
-        # Resolve this entry to its final ID (in case something points to it)
-        final_id = resolve_merged_entry(entry_id, merge_map)
-        
-        # Skip if we've already processed this final ID
-        if final_id in processed_final_ids:
-            continue
-        
-        # Get the actual entry to use (might be different if there were merges)
-        if final_id != entry_id:
-            actual_entry = next((e for e in local_dump if e.get("id") == final_id), None)
-            if not actual_entry:
-                continue
-        else:
-            actual_entry = entry
-        
-        # Now do the matching logic on the actual entry
-        texts_to_check = []
-        
-        # Primary titles
-        for field in ["title", "native_title", "romanized_title"]:
-            val = actual_entry.get(field)
-            if val:
-                texts_to_check.append(val)
-        
-        # Secondary titles
-        secondary = actual_entry.get("secondary_titles")
-        if isinstance(secondary, dict):
-            for lang_titles in secondary.values():
-                if isinstance(lang_titles, list):
-                    for t in lang_titles:
-                        if isinstance(t, dict) and t.get("title"):
-                            texts_to_check.append(t["title"])
-        
-        best_score = 0
-        best_match_text = None
-        
-        for text in texts_to_check:
-            text_norm = normalize_romaji_cached(text)
-            
-            # Exact match check first
-            if text_norm == search_term_norm:
-                best_score = 100
-                best_match_text = text
-                break
-            
-            # BALANCED: More selective substring matching
-            if search_term_norm in text_norm:
-                ratio = search_len / len(text_norm)
-                if ratio > 0.4:  # Slightly more restrictive than 0.3
-                    score = min(95, int(65 + (ratio * 30)))  # Better scoring
-                    if score > best_score:
-                        best_score = score
-                        best_match_text = text
-            
-            # BALANCED: Reverse substring check (text in search term) - more restrictive
-            elif text_norm in search_term_norm and len(text_norm) >= 4:  # Minimum length requirement
-                ratio = len(text_norm) / search_len
-                if ratio > 0.4:  # More restrictive
-                    score = min(85, int(50 + (ratio * 35)))
-                    if score > best_score:
-                        best_score = score
-                        best_match_text = text
-            
-            # BALANCED: More selective word overlap check
-            elif best_score < 75:
-                text_words = set(text_norm.split())
-                overlap = search_words & text_words
-                
-                if overlap and len(overlap) >= min(2, len(search_words)):  # Need at least 2 words or all words
-                    overlap_ratio = len(overlap) / len(search_words) if search_words else 0
-                    text_coverage = len(overlap) / len(text_words) if text_words else 0
-                    
-                    # Stricter requirements
-                    if overlap_ratio >= 0.5:  # Back to more restrictive
-                        word_score = int(45 + (overlap_ratio * 30))
-                        if word_score > best_score:
-                            best_score = word_score
-                            best_match_text = text
-                    elif text_coverage >= 0.6 and overlap_ratio >= 0.3:  # Good coverage + decent overlap
-                        word_score = int(40 + (text_coverage * 25))
-                        if word_score > best_score:
-                            best_score = word_score
-                            best_match_text = text
-            
-            # BALANCED: More restrictive fuzzy character-level matching
-            if best_score < 50 and len(search_term_norm) <= 6:  # Only for very short terms
-                # Simple character overlap for short terms
-                search_chars = set(search_term_norm.replace(' ', ''))
-                text_chars = set(text_norm.replace(' ', ''))
-                char_overlap = len(search_chars & text_chars)
-                
-                # Much stricter character matching
-                if char_overlap >= max(3, len(search_chars) * 0.8):  # Need most characters
-                    char_score = int(30 + (char_overlap / len(search_chars)) * 20)
-                    if char_score > best_score:
-                        best_score = char_score
-                        best_match_text = text
-        
-        # BALANCED: Higher threshold to avoid irrelevant results
-        if best_score >= 65:  # Balanced threshold
-            matches.append((actual_entry, best_score, best_match_text))
-            processed_final_ids.add(final_id)
-            
-            # Early termination for perfect matches
-            if best_score == 100 and len(matches) >= 30:
-                break
-    
-    # Sort by score and return balanced number of results
-    matches.sort(key=lambda x: x[1], reverse=True)
-    result_entries = [m[0] for m in matches[:30]]  # Balanced result count
-    
-    # Debug logging
-    logging.info(f"Merge-aware search for '{title}' found {len(result_entries)} unique entries")
-    for i, (entry, score, match_text) in enumerate(matches[:5]):
-        logging.info(f"  Result {i}: ID={entry.get('id')}, Score={score}, Title='{entry.get('title')}', Match='{match_text}'")
-    
-    return result_entries
 
 # Global cache for merge map to avoid rebuilding it every time
 _merge_map_cache = None
@@ -879,8 +748,9 @@ def get_cached_merge_map():
     return _merge_map_cache
 
 @lru_cache(maxsize=1000)
+
 def find_best_match_cached_merge_aware(title):
-    """IMPROVED: Version that uses cached merge map for better performance"""
+    """IMPROVED: Version that uses cached merge map with optimized sorting and strict matching"""
     if not local_dump:
         return []
     
@@ -888,32 +758,29 @@ def find_best_match_cached_merge_aware(title):
     if not search_term:
         return []
     
-    # Use cached merge map
+    # 1. USE THE CACHED MAP FOR PERFORMANCE
     merge_map, active_ids = get_cached_merge_map()
     
-    # IMPROVED search logic
     search_term_norm = normalize_romaji_cached(search_term)
     search_words = set(search_term_norm.split())
     search_len = len(search_term_norm)
     
     matches = []
-    processed_final_ids = set()
+    processed_final_ids = set()  # Track final IDs to avoid duplicates
     
     for entry in local_dump:
         entry_id = entry.get("id")
         state = entry.get("state", "").lower()
         
-        # Skip merged entries
+        # Completely skip merged entries early
         if state == "merged":
             continue
         
-        # Resolve to final ID
         final_id = resolve_merged_entry(entry_id, merge_map)
         
         if final_id in processed_final_ids:
             continue
         
-        # Get actual entry to use
         if final_id != entry_id:
             actual_entry = next((e for e in local_dump if e.get("id") == final_id), None)
             if not actual_entry:
@@ -921,8 +788,8 @@ def find_best_match_cached_merge_aware(title):
         else:
             actual_entry = entry
         
-        # Collect all searchable texts
         texts_to_check = []
+        
         for field in ["title", "native_title", "romanized_title"]:
             val = actual_entry.get(field)
             if val:
@@ -948,185 +815,30 @@ def find_best_match_cached_merge_aware(title):
                 best_match_text = text
                 break
             
-            # IMPROVED substring matching
+            # Substring matching
             elif search_term_norm in text_norm:
                 ratio = search_len / len(text_norm)
-                if ratio > 0.3:
-                    score = min(95, int(60 + (ratio * 35)))
-                    if score > best_score:
-                        best_score = score
-                        best_match_text = text
-            
-            # Reverse substring
-            elif text_norm in search_term_norm:
-                ratio = len(text_norm) / search_len
-                if ratio > 0.3:
-                    score = min(90, int(50 + (ratio * 40)))
-                    if score > best_score:
-                        best_score = score
-                        best_match_text = text
-            
-            # IMPROVED word overlap
-            elif best_score < 80:
-                text_words = set(text_norm.split())
-                overlap = search_words & text_words
-                
-                if overlap:
-                    overlap_ratio = len(overlap) / len(search_words) if search_words else 0
-                    text_coverage = len(overlap) / len(text_words) if text_words else 0
-                    
-                    if overlap_ratio >= 0.4:
-                        word_score = int(40 + (overlap_ratio * 40))
-                        if word_score > best_score:
-                            best_score = word_score
-                            best_match_text = text
-                    elif text_coverage >= 0.5:
-                        word_score = int(35 + (text_coverage * 35))
-                        if word_score > best_score:
-                            best_score = word_score
-                            best_match_text = text
-            
-            # Character-level fuzzy matching for short terms
-            if best_score < 60 and len(search_term_norm) <= 8:
-                search_chars = set(search_term_norm.replace(' ', ''))
-                text_chars = set(text_norm.replace(' ', ''))
-                char_overlap = len(search_chars & text_chars)
-                
-                if char_overlap >= max(2, len(search_chars) * 0.6):
-                    char_score = int(25 + (char_overlap / len(search_chars)) * 25)
-                    if char_score > best_score:
-                        best_score = char_score
-                        best_match_text = text
-        
-        # BALANCED: Tighter threshold
-        if best_score >= 65:
-            matches.append((actual_entry, best_score, best_match_text))
-            processed_final_ids.add(final_id)
-            
-            # Less aggressive early termination
-            if best_score == 100 and len(matches) >= 20:
-                break
-    
-    matches.sort(key=lambda x: x[1], reverse=True)
-    return [m[0] for m in matches[:30]]
-
-def build_search_index(local_dump):
-    """Build a search index for faster lookups - call this once when loading data"""
-    word_to_entries = defaultdict(set)
-    entry_texts = {}
-    
-    for i, entry in enumerate(local_dump):
-        entry_id = entry.get("id")
-        if not entry_id:
-            continue
-            
-        all_texts = []
-        
-        # Collect all searchable text
-        for field in ["title", "native_title", "romanized_title"]:
-            val = entry.get(field)
-            if val:
-                all_texts.append(val)
-        
-        secondary = entry.get("secondary_titles")
-        if isinstance(secondary, dict):
-            for lang_titles in secondary.values():
-                if isinstance(lang_titles, list):
-                    for t in lang_titles:
-                        if isinstance(t, dict) and t.get("title"):
-                            all_texts.append(t["title"])
-        
-        # Store normalized texts for this entry
-        entry_texts[entry_id] = [(text, normalize_romaji_cached(text)) for text in all_texts]
-        
-        # IMPROVED: Index more comprehensively
-        for text, text_norm in entry_texts[entry_id]:
-            # Index full words
-            for word in text_norm.split():
-                if len(word) > 1:
-                    word_to_entries[word].add(entry_id)
-            
-            # IMPROVED: Index character n-grams for better partial matching
-            if len(text_norm.replace(' ', '')) >= 3:
-                clean_text = text_norm.replace(' ', '')
-                for i in range(len(clean_text) - 2):
-                    trigram = clean_text[i:i+3]
-                    word_to_entries[f"__{trigram}"].add(entry_id)
-    
-    return word_to_entries, entry_texts
-
-def find_best_match_indexed(title, word_index, entry_texts):
-    """IMPROVED: Ultra-fast search using pre-built index"""
-    if not title.strip():
-        return []
-    
-    search_term_norm = normalize_romaji_cached(title.strip())
-    search_words = set(search_term_norm.split())
-    
-    # Find candidate entries using index
-    candidate_ids = set()
-    
-    # Word-based candidates
-    for word in search_words:
-        if word in word_index:
-            candidate_ids.update(word_index[word])
-    
-    # IMPROVED: Also try n-gram matching for partial matches
-    if len(candidate_ids) < 20:  # If we don't have many candidates, try harder
-        clean_search = search_term_norm.replace(' ', '')
-        if len(clean_search) >= 3:
-            for i in range(len(clean_search) - 2):
-                trigram = clean_search[i:i+3]
-                trigram_key = f"__{trigram}"
-                if trigram_key in word_index:
-                    candidate_ids.update(word_index[trigram_key])
-    
-    if not candidate_ids:
-        return []
-    
-    # Score only the candidates with IMPROVED scoring
-    matches = []
-    for entry_id in candidate_ids:
-        if entry_id not in entry_texts:
-            continue
-            
-        entry = next((e for e in local_dump if e.get("id") == entry_id), None)
-        if not entry:
-            continue
-        
-        best_score = 0
-        best_match_text = None
-        
-        for text, text_norm in entry_texts[entry_id]:
-            # Exact match
-            if text_norm == search_term_norm:
-                best_score = 100
-                best_match_text = text
-                break
-            
-            # BALANCED substring matching
-            elif search_term_norm in text_norm:
-                ratio = len(search_term_norm) / len(text_norm)
                 if ratio > 0.4:
                     score = min(95, int(65 + (ratio * 30)))
                     if score > best_score:
                         best_score = score
                         best_match_text = text
             
-            # Reverse substring with restrictions
+            # Reverse substring
             elif text_norm in search_term_norm and len(text_norm) >= 4:
-                ratio = len(text_norm) / len(search_term_norm)
+                ratio = len(text_norm) / search_len
                 if ratio > 0.4:
                     score = min(85, int(50 + (ratio * 35)))
                     if score > best_score:
                         best_score = score
                         best_match_text = text
             
-            # Word overlap
+            # Word overlap (Restored strict `len(overlap) >= min(2, len(search_words))` rule)
             else:
                 text_words = set(text_norm.split())
                 overlap = search_words & text_words
                 
+                # Strict overlap rule prevents false positives from single-word matches
                 if overlap and len(overlap) >= min(2, len(search_words)):
                     overlap_ratio = len(overlap) / len(search_words) if search_words else 0
                     text_coverage = len(overlap) / len(text_words) if text_words else 0
@@ -1142,7 +854,7 @@ def find_best_match_indexed(title, word_index, entry_texts):
                             best_score = word_score
                             best_match_text = text
                 
-                # Character-level matching for very short terms only
+                # Character-level fuzzy matching for short terms
                 if best_score < 50 and len(search_term_norm) <= 6:
                     search_chars = set(search_term_norm.replace(' ', ''))
                     text_chars = set(text_norm.replace(' ', ''))
@@ -1154,186 +866,90 @@ def find_best_match_indexed(title, word_index, entry_texts):
                             best_score = char_score
                             best_match_text = text
         
-        # BALANCED: Stricter threshold
         if best_score >= 65:
-            matches.append((entry, best_score, best_match_text))
-    
+            matches.append((actual_entry, best_score, best_match_text))
+            processed_final_ids.add(final_id)
+            
+            # Fast break for exact matches
+            if best_score == 100 and len(matches) >= 30:
+                break
+                
+    # Sort ONCE at the very end
     matches.sort(key=lambda x: x[1], reverse=True)
-    return [m[0] for m in matches[:30]]
     
-def get_metadata_from_dump_or_api(title, local_only=False):
-    """Fixed version with optimized search and better error handling"""
+    result_entries = [m[0] for m in matches[:30]]
+    return result_entries
+
+
+def get_metadata_from_dump(title):
+    """Fixed version using byte-offsets for massive RAM reduction"""
     if not title or not title.strip():
         return []
     
-    # Handle direct URL case
-    if is_url(title):
-        if not local_only:
-            return get_metadata_from_direct_url(title)
-        else:
-            return []
-    
     logging.info(f"Fetching metadata for: {title}")
     
-    # LOCAL SEARCH - Use merge-aware version
-    matches = find_best_match_cached_merge_aware(title)  # Handles merged entries
+    matches = find_best_match_cached_merge_aware(title)
     if matches:
         try:
-            # Extract metadata from matches
             metadata_results = []
-            for match in matches:
-                metadata = MetadataGUI.extract_metadata(match)
-                metadata_results.append(metadata)
+            # Open the file once to grab the full JSON for our top matches
+            with open(DUMP_PATH, 'rb') as f:
+                for match in matches:
+                    # Jump to the exact byte in the 3.3GB file!
+                    f.seek(match["_offset"])
+                    full_raw_json = json.loads(f.readline().decode('utf-8'))
+                    
+                    # Extract using the FULL json, not the slim match
+                    metadata = MetadataGUI.extract_metadata(full_raw_json)
+                    metadata_results.append(metadata)
             
-            # DEBUG: Log what we found locally
             logging.info(f"Found {len(metadata_results)} local matches")
-            for i, meta in enumerate(metadata_results[:3]):  # Log first 3
-                logging.info(f"  Local match {i}: ID={meta.get('entry_id')}, Title='{meta.get('Title')}'")
-            
             return metadata_results
             
         except Exception as e:
             logging.error(f"Error processing local matches: {e}")
-            # Continue to API search if local processing fails
     
-    # If local_only mode and no matches, return empty
-    if local_only:
-        logging.info("No local matches found and local_only=True")
-        return []
-    
-    # API SEARCH - Only if not local_only
-    query_key = title.lower().strip()
-    
-    # Check API cache first
-    if query_key in api_cache:
-        logging.info("Loaded metadata from API cache")
-        cached_result = api_cache[query_key]
-        
-        # Handle different cache formats
-        if isinstance(cached_result, dict):
-            return [cached_result]
-        elif isinstance(cached_result, list):
-            return cached_result
-        else:
-            logging.warning(f"Invalid cache format for '{query_key}': {type(cached_result)}")
-            # Clear invalid cache entry
-            del api_cache[query_key]
-    
-    # Make API request
-    try:
-        encoded_title = quote(title)
-        api_url = f"https://mangabaka.dev/api/search?query={encoded_title}"
-        logging.info(f"Making API request to: {api_url}")
-        
-        response = get_api_session().get(
-            api_url,
-            timeout=10,
-            headers={'User-Agent': 'CBZ-Metadata-Tool/1.0'}
-        )
-        response.raise_for_status()
-        
-        data = response.json()
-        logging.info(f"API returned {len(data) if isinstance(data, list) else 'non-list'} results")
-        
-        if data and isinstance(data, list):
-            # Process API results
-            results = []
-            for i, item in enumerate(data):
-                try:
-                    metadata = MetadataGUI.extract_metadata(item)
-                    results.append(metadata)
-                    
-                    # DEBUG: Log API results
-                    if i < 3:  # Log first 3
-                        logging.info(f"  API result {i}: ID={metadata.get('entry_id')}, Title='{metadata.get('Title')}'")
-                        
-                except Exception as e:
-                    logging.error(f"Error extracting metadata from API result {i}: {e}")
-                    continue
-            
-            if results:
-                # Cache the results - store the full list, not just first result
-                api_cache[query_key] = results
-                save_api_cache()
-                logging.info(f"Cached {len(results)} API results")
-                return results
-            else:
-                logging.warning("API returned data but no valid metadata could be extracted")
-        else:
-            logging.warning(f"API returned unexpected data format: {type(data)}")
-            
-    except requests.exceptions.Timeout:
-        logging.error(f"API request timeout for: {title}")
-    except requests.exceptions.ConnectionError:
-        logging.error(f"API connection error for: {title}")
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"API HTTP error for '{title}': {e.response.status_code}")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"API request error for '{title}': {e}")
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON decode error for '{title}': {e}")
-    except Exception as e:
-        logging.error(f"Unexpected API error for '{title}': {e}")
-    
-    # Return empty list if everything fails
-    logging.info(f"No metadata found for: {title}")
+    logging.info(f"No metadata found locally for: {title}")
     return []
 
-# Indexed search for very large datasets
-def get_metadata_from_dump_or_api_indexed(title, local_only=False, word_index=None, entry_texts=None):
-    """Ultra-fast version using pre-built search index"""
-    if not title or not title.strip():
-        return []
-    
-    if is_url(title):
-        if not local_only:
-            return get_metadata_from_direct_url(title)
-        else:
-            return []
-    
-    logging.info(f"Fetching metadata (indexed) for: {title}")
-    
-    # LOCAL SEARCH with index
-    if word_index and entry_texts:
-        matches = find_best_match_indexed(title, word_index, entry_texts)
-        if matches:
-            try:
-                metadata_results = []
-                for match in matches:
-                    metadata = MetadataGUI.extract_metadata(match)
-                    metadata_results.append(metadata)
-                
-                logging.info(f"Found {len(metadata_results)} indexed local matches")
-                return metadata_results
-                
-            except Exception as e:
-                logging.error(f"Error processing indexed matches: {e}")
-    
-    # Fall back to regular search if index not available
-    return get_metadata_from_dump_or_api(title, local_only)
-
-# Helper function to initialize the search index (call once when loading data)
-def initialize_search_index():
-    """Call this once when your application starts to build the search index"""
-    if local_dump:
-        logging.info("Building search index...")
-        word_index, entry_texts = build_search_index(local_dump)
-        logging.info(f"Search index built: {len(word_index)} words, {len(entry_texts)} entries")
-        return word_index, entry_texts
-    return None, None
+def get_metadata_from_dump_by_id(entry_id):
+    """Fetch exact match from local dump using the Mangabaka numeric ID and byte-offset"""
+    if not local_dump:
+        return None
+        
+    try:
+        entry_id = int(entry_id)
+        merge_map, _ = get_cached_merge_map()
+        final_id = resolve_merged_entry(entry_id, merge_map)
+        
+        for entry in local_dump:
+            if entry.get("id") == final_id:
+                # We found the ID, jump to the file offset and grab the full data
+                with open(DUMP_PATH, 'rb') as f:
+                    f.seek(entry["_offset"])
+                    full_raw_json = json.loads(f.readline().decode('utf-8'))
+                    return MetadataGUI.extract_metadata(full_raw_json)
+    except Exception as e:
+        logging.error(f"Error fetching by ID: {e}")
+        
+    return None
 
 def create_comicinfo_xml(metadata):
+    """Create ComicInfo.xml ensuring no string literal 'None' or '[]' values slip in"""
     comic_info = ET.Element("ComicInfo")
-    # Add XML schema attributes for better compatibility
     comic_info.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
     comic_info.set("xmlns:xsd", "http://www.w3.org/2001/XMLSchema")
     
-    for key, value in metadata.items():
-        if value and str(value).strip():  # Only add non-empty values
-            element = ET.SubElement(comic_info, key)
-            element.text = str(value).strip()
+    invalid_literals = {"none", "null", "[]", "{}"}
     
-    # Create XML declaration and return properly formatted XML
+    for key, value in metadata.items():
+        if value is not None:
+            str_val = str(value).strip()
+            # Prevent literal 'None' strings from writing to the XML
+            if str_val and str_val.lower() not in invalid_literals:
+                element = ET.SubElement(comic_info, key)
+                element.text = str_val
+    
     xml_str = ET.tostring(comic_info, encoding='unicode', method='xml')
     return f'<?xml version="1.0" encoding="utf-8"?>\n{xml_str}'
 
@@ -1356,106 +972,32 @@ def insert_comicinfo_into_cbz(cbz_path, xml_data):
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-            except OSError:  # Changed from bare except
+            except OSError:
                 pass
         raise
 
-
 def extract_volume_from_filename(filename):
-    """Extract volume number from filename using pre-compiled patterns"""
-    # Try main volume pattern first (fastest)
-    match = VOLUME_PATTERN.search(filename)
-    if match:
-        return match.group(1)
-    
-    # Try volume at start
-    match = VOLUME_START_PATTERN.search(filename)
-    if match:
-        return match.group(1)
-    
-    # Try standalone v pattern
-    match = STANDALONE_V_PATTERN.search(filename)
-    if match:
-        return match.group(1)
-    
-    # Try reversed format
-    match = REVERSED_VOLUME_PATTERN.search(filename)
-    if match:
-        return match.group(1)
-    
+    for pattern in [VOLUME_PATTERN, VOLUME_START_PATTERN, STANDALONE_V_PATTERN, REVERSED_VOLUME_PATTERN]:
+        match = pattern.search(filename)
+        if match:
+            return match.group(1)
     return None
-
 
 
 def extract_chapter_from_filename(filename):
-    """Extract chapter number from filename using CHAPTER_PATTERN"""
-    # Use the pre-compiled CHAPTER_PATTERN
     match = CHAPTER_PATTERN.search(filename)
-    if match:
-        return match.group(1)
-    return None
+    return match.group(1) if match else None
 
 def extract_anilist_id_from_url(url):
-    """Extract AniList manga ID from URL - handles comma-separated AND newline-separated URLs"""
-    try:
-        if not url or not isinstance(url, str):
-            raise ValueError("URL is empty or not a string")
-            
-        original_url = url  # Keep original for error messages
+    """Dramatically simplified, bulletproof regex extraction"""
+    if not url or not isinstance(url, str):
+        raise ValueError("URL is empty or not a string")
         
-        # Handle both comma-separated AND newline-separated URLs
-        urls = []
-        if ',' in url:
-            # Comma-separated
-            urls = [u.strip() for u in url.split(',') if u.strip()]
-        else:
-            # Newline-separated (or single URL)
-            urls = [u.strip() for u in url.split('\n') if u.strip()]
+    match = ANILIST_URL_PATTERN.search(url)
+    if not match:
+        raise ValueError(f"No valid AniList manga ID found in URL: {url}")
         
-        # Find the first AniList URL
-        anilist_url = None
-        for u in urls:
-            if 'anilist.co' in u.lower():
-                anilist_url = u.strip()
-                break
-        
-        if not anilist_url:
-            available_domains = [urlparse(u).netloc for u in urls[:5]]  # Show first 5 domains
-            raise ValueError(f"No AniList URL found. Available domains: {available_domains}")
-        
-        # Clean the URL
-        if not anilist_url.startswith(('http://', 'https://')):
-            # Try to find a URL pattern within the string
-            import re
-            url_match = re.search(r'https?://[^\s]+', anilist_url)
-            if url_match:
-                anilist_url = url_match.group(0)
-            else:
-                raise ValueError(f"No valid URL pattern found in: {anilist_url}")
-        
-        parsed = urlparse(anilist_url)
-        if 'anilist.co' not in parsed.netloc.lower():
-            raise ValueError(f"URL is not an AniList URL: {anilist_url}")
-        
-        # Handle URLs like https://anilist.co/manga/12345/title-name
-        path_parts = parsed.path.strip('/').split('/')
-        if len(path_parts) < 2:
-            raise ValueError(f"URL path too short: {parsed.path}")
-        
-        if path_parts[0] != 'manga':
-            raise ValueError(f"URL is not a manga URL (found: {path_parts[0]}): {anilist_url}")
-        
-        # Extract only the numeric part from path_parts[1]
-        import re
-        numeric_match = re.search(r'^\d+', path_parts[1])
-        if not numeric_match:
-            raise ValueError(f"No numeric ID found in URL path segment: {path_parts[1]}")
-        
-        return numeric_match.group(0)
-        
-    except Exception as e:
-        logging.error(f"Error extracting AniList ID from URL '{url[:200]}...': {e}")
-        raise  # Re-raise the exception so calling code can handle it with specific error messages
+    return match.group(1)
 
 def rate_limit(max_calls_per_minute=60):
     """Decorator to limit API calls per minute"""
@@ -1515,202 +1057,91 @@ def make_anilist_request(query, variables, max_retries=3):
 
 def fetch_anilist_metadata(anilist_id, max_pages_per_type=50):
     """Fetch metadata from AniList GraphQL API with pagination for both staff and characters"""
-    if not anilist_id:
+    if not anilist_id or not str(anilist_id).isdigit():
+        logging.error(f"Invalid or missing AniList ID: '{anilist_id}'")
         return None
-    
-    # Validate that anilist_id is purely numeric
-    if not str(anilist_id).isdigit():
-        logging.error(f"Invalid AniList ID format: '{anilist_id}' - must be numeric")
-        return None
-    
-    # First query to get basic info, characters, and staff
-    query = '''
+
+    def fetch_pages(query_template, field_name, initial_edges, initial_page_info):
+        """Helper to paginate any edge type without repeating loop logic"""
+        edges = initial_edges.copy()
+        page_info = initial_page_info
+        page = page_info['currentPage']
+        fetched = 0
+
+        while page_info['hasNextPage'] and fetched < max_pages_per_type:
+            page += 1
+            fetched += 1
+            print(f"Fetching {field_name} page {page}...")
+
+            try:
+                data = make_anilist_request(query_template, {'id': int(anilist_id), 'page': page})
+                if not data or 'data' not in data or not data['data']['Media']:
+                    break
+                page_data = data['data']['Media'][field_name]
+                edges.extend(page_data['edges'])
+                page_info = page_data['pageInfo']
+            except Exception as e:
+                print(f"Error fetching {field_name} page {page}: {e}")
+                break
+
+        if fetched >= max_pages_per_type and page_info.get('hasNextPage'):
+            print(f"Reached maximum limit ({max_pages_per_type}). Some {field_name} may not be included.")
+
+        return edges, fetched
+
+    initial_query = """
     query ($id: Int) {
         Media(id: $id, type: MANGA) {
-            id
-            title {
-                romaji
-                english
-                native
-            }
+            id title { romaji english native }
             characters(perPage: 100, sort: FAVOURITES_DESC) {
-                pageInfo {
-                    hasNextPage
-                    currentPage
-                }
-                edges {
-                    role
-                    node {
-                        name {
-                            first
-                            middle
-                            last
-                            full
-                            native
-                            alternative
-                        }
-                    }
-                }
+                pageInfo { hasNextPage currentPage }
+                edges { role node { name { first middle last full native alternative } } }
             }
             staff(perPage: 100, sort: FAVOURITES_DESC) {
-                pageInfo {
-                    hasNextPage
-                    currentPage
-                }
-                edges {
-                    role
-                    node {
-                        name {
-                            full
-                        }
-                    }
-                }
+                pageInfo { hasNextPage currentPage }
+                edges { role node { name { full } } }
             }
         }
-    }
-    '''
-    
-    variables = {'id': int(anilist_id)}
-    
+    }"""
+
+    page_query = """
+    query ($id: Int, $page: Int) {
+        Media(id: $id, type: MANGA) {
+            %s(page: $page, perPage: 100, sort: FAVOURITES_DESC) {
+                pageInfo { hasNextPage currentPage }
+                edges { role node { name { %s } } }
+            }
+        }
+    }"""
+
     try:
-        # Fetch first page
         print(f"Fetching initial data for AniList ID: {anilist_id}")
-        data = make_anilist_request(query, variables)
-        
-        if not data or not ('data' in data and data['data']['Media']):
+        data = make_anilist_request(initial_query, {'id': int(anilist_id)})
+
+        if not data or 'data' not in data or not data['data']['Media']:
             logging.error(f"No data found for AniList ID: {anilist_id}")
             return None
-        
-        media_data = data['data']['Media']
-        all_staff = media_data['staff']['edges'].copy()
-        all_characters = media_data['characters']['edges'].copy()
-        
-        # Check if there are more pages of staff data
-        staff_page_info = media_data['staff']['pageInfo']
-        staff_current_page = staff_page_info['currentPage']
-        staff_pages_fetched = 0
-        
-        # Fetch additional pages of staff if needed (with limits)
-        while staff_page_info['hasNextPage'] and staff_pages_fetched < max_pages_per_type:
-            staff_current_page += 1
-            staff_pages_fetched += 1
-            
-            print(f"Fetching staff page {staff_current_page}...")
-            
-            # Query for next page of staff
-            staff_query = '''
-            query ($id: Int, $page: Int) {
-                Media(id: $id, type: MANGA) {
-                    staff(page: $page, perPage: 100, sort: FAVOURITES_DESC) {
-                        pageInfo {
-                            hasNextPage
-                            currentPage
-                        }
-                        edges {
-                            role
-                            node {
-                                name {
-                                    full
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            '''
-            
-            staff_variables = {'id': int(anilist_id), 'page': staff_current_page}
-            
-            try:
-                staff_data = make_anilist_request(staff_query, staff_variables)
-                if staff_data and 'data' in staff_data and staff_data['data']['Media']:
-                    staff_page = staff_data['data']['Media']['staff']
-                    all_staff.extend(staff_page['edges'])
-                    staff_page_info = staff_page['pageInfo']
-                else:
-                    print(f"No more staff data available at page {staff_current_page}")
-                    break
-            except Exception as e:
-                print(f"Error fetching staff page {staff_current_page}: {e}")
-                break
-        
-        if staff_pages_fetched >= max_pages_per_type and staff_page_info.get('hasNextPage'):
-            print(f"Reached maximum staff pages limit ({max_pages_per_type}). Some staff may not be included.")
-        
-        # Check if there are more pages of character data
-        char_page_info = media_data['characters']['pageInfo']
-        char_current_page = char_page_info['currentPage']
-        char_pages_fetched = 0
-        
-        # Fetch additional pages of characters if needed (with limits)
-        while char_page_info['hasNextPage'] and char_pages_fetched < max_pages_per_type:
-            char_current_page += 1
-            char_pages_fetched += 1
-            
-            print(f"Fetching characters page {char_current_page}...")
-            
-            # Query for next page of characters
-            char_query = '''
-            query ($id: Int, $page: Int) {
-                Media(id: $id, type: MANGA) {
-                    characters(page: $page, perPage: 100, sort: FAVOURITES_DESC) {
-                        pageInfo {
-                            hasNextPage
-                            currentPage
-                        }
-                        edges {
-                            role
-                            node {
-                                name {
-                                    first
-                                    middle
-                                    last
-                                    full
-                                    native
-                                    alternative
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            '''
-            
-            char_variables = {'id': int(anilist_id), 'page': char_current_page}
-            
-            try:
-                char_data = make_anilist_request(char_query, char_variables)
-                if char_data and 'data' in char_data and char_data['data']['Media']:
-                    char_page = char_data['data']['Media']['characters']
-                    all_characters.extend(char_page['edges'])
-                    char_page_info = char_page['pageInfo']
-                else:
-                    print(f"No more character data available at page {char_current_page}")
-                    break
-            except Exception as e:
-                print(f"Error fetching characters page {char_current_page}: {e}")
-                break
-        
-        if char_pages_fetched >= max_pages_per_type and char_page_info.get('hasNextPage'):
-            print(f"Reached maximum character pages limit ({max_pages_per_type}). Some characters may not be included.")
-        
-        # Update media_data with all staff and characters
-        media_data['staff']['edges'] = all_staff
-        media_data['characters']['edges'] = all_characters
-        
-        print(f"Result: Total staff members fetched: {len(all_staff)} (from {staff_pages_fetched + 1} pages)")
-        print(f"Result: Total characters fetched: {len(all_characters)} (from {char_pages_fetched + 1} pages)")
-        
-        return parse_anilist_data(media_data)
-            
-    except requests.exceptions.RequestException as e:
-        logging.error(f"AniList API request error: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        logging.error(f"AniList JSON decode error: {e}")
-        return None
+
+        media = data['data']['Media']
+
+        # Paginate Staff
+        staff_query = page_query % ("staff", "full")
+        all_staff, staff_pages = fetch_pages(staff_query, "staff", media['staff']['edges'], media['staff']['pageInfo'])
+
+        # Paginate Characters
+        char_query = page_query % ("characters", "first middle last full native alternative")
+        all_chars, char_pages = fetch_pages(char_query, "characters", media['characters']['edges'], media['characters']['pageInfo'])
+
+        media['staff']['edges'] = all_staff
+        media['characters']['edges'] = all_chars
+
+        print(f"Result: Total staff: {len(all_staff)} (from {staff_pages + 1} pages)")
+        print(f"Result: Total characters: {len(all_chars)} (from {char_pages + 1} pages)")
+
+        return parse_anilist_data(media)
+
     except Exception as e:
-        logging.error(f"Unexpected AniList API error: {e}")
+        logging.error(f"AniList API error: {e}")
         return None
 
 def construct_character_name(name_obj):
@@ -1718,12 +1149,10 @@ def construct_character_name(name_obj):
     if not name_obj:
         return None
     
-    # Try to construct from first, middle, last with proper null checks
     first = (name_obj.get('first') or '').strip()
     middle = (name_obj.get('middle') or '').strip()
     last = (name_obj.get('last') or '').strip()
     
-    # If we have individual components, construct the full name
     if first or middle or last:
         name_parts = []
         if first:
@@ -1735,17 +1164,14 @@ def construct_character_name(name_obj):
         
         if name_parts:
             constructed_name = ' '.join(name_parts)
-            # Prefer constructed name if it's more complete than the 'full' field
             full_name = (name_obj.get('full') or '').strip()
             if len(constructed_name) > len(full_name):
                 return constructed_name
     
-    # Fall back to 'full' field if construction didn't work or wasn't better
     full_name = (name_obj.get('full') or '').strip()
     if full_name:
         return full_name
     
-    # Last resort: try alternative names
     alternatives = name_obj.get('alternative', [])
     if alternatives and alternatives[0]:
         alt_name = alternatives[0]
@@ -1759,7 +1185,6 @@ def parse_anilist_data(media_data):
     metadata = {}
     
     try:
-        # Extract characters (main, supporting and background)
         characters = []
         if media_data.get('characters', {}).get('edges'):
             for char_edge in media_data['characters']['edges']:
@@ -1767,20 +1192,14 @@ def parse_anilist_data(media_data):
                 char_name = construct_character_name(name_obj)
                 char_role = char_edge.get('role', '').upper()
                 
-                if char_name and char_role in ['MAIN', 'SUPPORTING', 'BACKGROUND']:
+                # Check against global character roles
+                if char_name and char_role in ANILIST_CHARACTER_ROLES:
                     characters.append(char_name)
         metadata['Characters'] = ', '.join(characters)
         
-        # Extract staff information
         staff_roles = {
-            'Writer': [],
-            'Penciller': [],
-            'Inker': [],
-            'Colorist': [],
-            'Letterer': [],
-            'CoverArtist': [],
-            'Editor': [],
-            'Translator': []
+            'Writer': [], 'Penciller': [], 'Inker': [], 'Colorist': [],
+            'Letterer': [], 'CoverArtist': [], 'Editor': [], 'Translator': []
         }
         
         if media_data.get('staff', {}).get('edges'):
@@ -1791,70 +1210,32 @@ def parse_anilist_data(media_data):
                 if not staff_name:
                     continue
                 
-                # Standard role mappings (these will also be applied in addition to art roles)
-                role_mappings = {
-                    'story': 'Writer',
-                    'story & art': 'Writer',
-                    'original creator': 'Writer',
-                    'original story': 'Writer',  # NEW: Added mapping
-                    'author': 'Writer',
-                    'writer': 'Writer',
-                    'artist': 'Penciller',
-                    'illustrator': 'Penciller',
-                    'inking': 'Inker',
-                    'color': 'Colorist',
-                    'coloring': 'Colorist',
-                    'lettering (english)': 'Letterer',
-                    'touch-up art & lettering (english)': 'Letterer',
-                    'cover': 'CoverArtist',
-                    'cover art': 'CoverArtist',
-                    'assistant': 'CoverArtist',  # NEW: Added mapping
-                    'assistant (former)': 'CoverArtist',  # NEW: Added mapping
-                    'assistant (Former)': 'CoverArtist',  # NEW: Added mapping (capital F)
-                    'editor': 'Editor',
-                    'editorial': 'Editor',
-                    'translation': 'Translator',
-                    'translator (english)': 'Translator'
-                }
+                # Check for global art roles
+                is_art_role = any(art_role in role for art_role in ANILIST_ART_ROLES)
                 
-                # Regex patterns for complex role formats
-                regex_mappings = [
-                    (r'touch-up art & lettering.*', 'Letterer'),  # Matches "Touch-up Art & Lettering (English: vol 34)"
-                    (r'^translator \(english.*', 'Translator'),   # Matches "Translator (English: vol 36)" - more specific
-                    (r'editing \(.*\)', 'Editor')                 # FIXED: Changed from ^editing to editing and added closing parenthesis
-                ]
-                
-                # Check for roles that should be added to all art-related fields
-                art_roles = ['character design', 'art', 'story & art']
-                is_art_role = any(art_role in role for art_role in art_roles)
-                
-                # Exclude touch-up art & lettering AND any touch-up roles from being added to all art fields
                 is_touchup_lettering = 'touch-up art & lettering' in role.lower()
                 is_touchup = 'touch-up' in role.lower()
                 
                 if is_art_role and not is_touchup_lettering and not is_touchup:
-                    # Add to all art-related fields
                     for art_field in ['Penciller', 'Inker', 'Colorist']:
                         staff_roles[art_field].append(staff_name)
                 
-                # Apply regex mappings first (more specific)
+                # Apply global regex mappings first
                 matched = False
-                for pattern, target_field in regex_mappings:
+                for pattern, target_field in ANILIST_STAFF_REGEX_MAPPINGS:
                     if re.match(pattern, role.lower(), re.IGNORECASE):
                         staff_roles[target_field].append(staff_name)
                         matched = True
-                        break  # Stop after first match to avoid duplicates
+                        break
                 
-                # Apply standard role mappings only if no regex match
+                # Apply standard global role mappings
                 if not matched:
                     role_lower = role.lower()
-                    if role_lower in role_mappings:
-                        staff_roles[role_mappings[role_lower]].append(staff_name)
+                    if role_lower in ANILIST_STAFF_ROLE_MAPPINGS:
+                        staff_roles[ANILIST_STAFF_ROLE_MAPPINGS[role_lower]].append(staff_name)
         
-        # Convert staff lists to comma-separated strings
         for role, names in staff_roles.items():
             if names:
-                # Remove duplicates while preserving order
                 unique_names = []
                 seen = set()
                 for name in names:
@@ -1874,10 +1255,12 @@ def parse_anilist_data(media_data):
 def count_pages_in_cbz(path):
     try:
         with zipfile.ZipFile(path, 'r') as cbz:
-            image_extensions = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
             count = 0
             for name in cbz.namelist():
-                if name.lower().endswith(image_extensions) and not name.startswith('__MACOSX/'):
+                if name.startswith('__MACOSX/'):
+                    continue
+                _, ext = os.path.splitext(name)
+                if ext.lower() in IMAGE_EXTENSIONS:
                     count += 1
             return count
     except Exception as e:
@@ -1885,29 +1268,35 @@ def count_pages_in_cbz(path):
         return 0
 
 def auto_extract_title(filename):
-    """Extract and clean title from filename using optimized regex"""
-    # Remove extension
-    name = EXTENSION_PATTERN.sub('', os.path.basename(filename))
+    name = os.path.splitext(os.path.basename(filename))[0]
     
-    # Remove brackets and parentheses content
-    name = BRACKET_CONTENT_PATTERN.sub('', name)
-    name = PAREN_CONTENT_PATTERN.sub('', name)
+    for pattern in TITLE_CLEANUP_PATTERNS:
+        match = pattern.search(name)
+        if match:
+            title = match.group(1).strip()
+            title = re.sub(r'[\s\-]+$', '', title)
+            return title
     
-    # Remove volume/chapter markers
-    name = VOLUME_PATTERN.sub('', name)
-    name = CHAPTER_PATTERN.sub('', name)
-    
-    # Replace separators with spaces
-    name = SEPARATOR_PATTERN.sub(' ', name)
-    
-    # Normalize whitespace
-    name = WHITESPACE_PATTERN.sub(' ', name)
-    
-    cleaned = name.strip().title()
-    logging.info(f"Auto-extracted title from filename '{filename}': '{cleaned}'")
-    return cleaned
+    cleaned = BRACKET_REMOVAL_PATTERN.sub('', name)
+    cleaned = SCANLATOR_REMOVAL_PATTERN .sub('', cleaned)
+    return cleaned.strip() if cleaned.strip() else None
 
+def natural_sort_key(path):
+    # Sort by full path so files in the same folder stay grouped together
+    # USE SINGLE BACKSLASHES HERE
+    parts = re.split(r'(\d+(?:\.\d+)?)', path.replace('\\', '/').lower())
 
+    key = []
+    for part in parts:
+        if not part:
+            continue
+        # USE SINGLE BACKSLASHES HERE TOO
+        if re.fullmatch(r'\d+(?:\.\d+)?', part):
+            key.append((0, float(part) if '.' in part else int(part)))
+        else:
+            key.append((1, part))
+    return key
+    
 class SeriesManagerDialog(tk.Toplevel):
     """Dialog for managing saved series metadata"""
     
@@ -1924,7 +1313,6 @@ class SeriesManagerDialog(tk.Toplevel):
         self.create_widgets()
         self.refresh_series_list()
         
-        # Center the dialog LAST
         self.geometry("900x600")
         self.update_idletasks()
         center_window(self, 900, 600)
@@ -1933,7 +1321,6 @@ class SeriesManagerDialog(tk.Toplevel):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill='both', expand=True)
         
-        # Search frame
         search_frame = ttk.Frame(main_frame)
         search_frame.pack(fill='x', pady=(0, 10))
         
@@ -1947,11 +1334,9 @@ class SeriesManagerDialog(tk.Toplevel):
         self.search_entry.bind('<KeyRelease>', self.on_search)
         ToolTip(self.search_entry, "Type to filter the series list by name or alias")
         
-        # Series list frame
         list_frame = ttk.LabelFrame(main_frame, text="Saved Series", padding=5)
         list_frame.pack(fill='both', expand=True, pady=(0, 10))
         
-        # Treeview for series list (fixed column order)
         columns = ('Series', 'Aliases', 'Last Updated')
         self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=15)
         self.tree.heading('Series', text='Series Name')
@@ -1962,7 +1347,6 @@ class SeriesManagerDialog(tk.Toplevel):
         self.tree.column('Last Updated', width=150)
         ToolTip(self.tree, "Double-click on a series to load its metadata.\nShows series name, aliases, and last update date.")
         
-        # Scrollbar for treeview
         scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         
@@ -1971,11 +1355,9 @@ class SeriesManagerDialog(tk.Toplevel):
         
         self.tree.bind('<Double-1>', self.on_series_select)
         
-        # Button frame
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill='x')
         
-        # Load buttons
         load_all_btn = ttk.Button(button_frame, text="Load to All Files", command=self.load_to_all_files)
         load_all_btn.pack(side='left', padx=(0, 5))
         ToolTip(load_all_btn, "Load selected series metadata to all files in the current list")
@@ -1984,7 +1366,6 @@ class SeriesManagerDialog(tk.Toplevel):
         load_selected_btn.pack(side='left', padx=(0, 5))
         ToolTip(load_selected_btn, "Load selected series metadata only to the currently selected file")
         
-        # Match buttons
         match_file_btn = ttk.Button(button_frame, text="Match - File", command=self.match_current_file)
         match_file_btn.pack(side='left', padx=(0, 5))
         ToolTip(match_file_btn, "Try to automatically match the current file with a series from the database")
@@ -1993,12 +1374,10 @@ class SeriesManagerDialog(tk.Toplevel):
         match_all_btn.pack(side='left', padx=(0, 5))
         ToolTip(match_all_btn, "Try to automatically match all files with series from the database")
         
-        # Alias button
         edit_aliases_btn = ttk.Button(button_frame, text="Edit Aliases", command=self.edit_aliases)
         edit_aliases_btn.pack(side='left', padx=(0, 5))
         ToolTip(edit_aliases_btn, "Edit the aliases for the selected series")
         
-        # Other buttons
         delete_btn = ttk.Button(button_frame, text="Delete Selected", command=self.delete_selected_series)
         delete_btn.pack(side='left', padx=(0, 5))
         ToolTip(delete_btn, "Delete the selected series from the database (cannot be undone)")
@@ -2012,24 +1391,19 @@ class SeriesManagerDialog(tk.Toplevel):
         ToolTip(close_btn, "Close the series manager dialog")
         
     def refresh_series_list(self):
-        """Refresh the series list with aliases - FIXED VERSION"""
         self.search_var.set("")
         results = series_db.get_all_series_with_aliases()
         self.populate_tree(results)
         
     def populate_tree(self, series_list):
-        """Populate the treeview with series data including aliases - FIXED VERSION"""
-        # Clear existing items
         for item in self.tree.get_children():
             self.tree.delete(item)
 
         for series_data in series_list:
             try:
                 if len(series_data) == 3:
-                    # Database returns: (series_name, updated_at, aliases)
                     series_name, updated_at, aliases = series_data
 
-                    # Format the date safely
                     try:
                         if updated_at:
                             dt = datetime.fromisoformat(updated_at)
@@ -2040,13 +1414,11 @@ class SeriesManagerDialog(tk.Toplevel):
                         print(f"Date formatting error for {series_name}: {date_error}")
                         formatted_date = str(updated_at) if updated_at else ""
 
-                    # Join aliases safely - FIXED: Handle string and list cases
                     if aliases:
                         if isinstance(aliases, list):
                             valid_aliases = [a.strip() for a in aliases if a and a.strip()]
                             aliases_text = ", ".join(valid_aliases)
                         elif isinstance(aliases, str):
-                            # Handle case where aliases is a delimited string
                             alias_list = [a.strip() for a in aliases.split('|') if a and a.strip()]
                             aliases_text = ", ".join(alias_list)
                         else:
@@ -2054,11 +1426,9 @@ class SeriesManagerDialog(tk.Toplevel):
                     else:
                         aliases_text = ""
 
-                    # Insert in CORRECT order: Series Name, Aliases, Last Updated
                     self.tree.insert('', 'end', values=(series_name, aliases_text, formatted_date))
 
                 elif len(series_data) == 2:
-                    # Fallback for old format without aliases
                     series_name, updated_at = series_data
                     try:
                         dt = datetime.fromisoformat(updated_at)
@@ -2068,7 +1438,6 @@ class SeriesManagerDialog(tk.Toplevel):
                     
                     self.tree.insert('', 'end', values=(series_name, "", formatted_date))
                 else:
-                    # Fallback for unexpected structure
                     series_name = series_data[0] if len(series_data) > 0 else "Unknown"
                     self.tree.insert('', 'end', values=(series_name, "Error", "Error"))
 
@@ -2077,21 +1446,44 @@ class SeriesManagerDialog(tk.Toplevel):
                 safe_name = str(series_data[0]) if len(series_data) > 0 else "Error"
                 self.tree.insert('', 'end', values=(safe_name, "Error", "Error"))
 
+    def search_series_with_aliases(self, search_term):
+        if not search_term or not search_term.strip():
+            return self.get_all_series_with_aliases()
+            
+        search_pattern = f"%{search_term.strip()}%"
+        cursor = self.conn.cursor()
+        
+        try:
+            # Matches search term against series name OR any of its aliases
+            cursor.execute("""
+                SELECT sm.series_name, sm.updated_at, GROUP_CONCAT(sa.alias, '|') as aliases
+                FROM series_metadata sm
+                LEFT JOIN series_aliases sa ON sm.series_name = sa.series_name
+                WHERE sm.series_name LIKE ? OR sm.series_name IN (
+                    SELECT series_name FROM series_aliases WHERE alias LIKE ?
+                )
+                GROUP BY sm.series_name, sm.updated_at
+                ORDER BY sm.updated_at DESC
+            """, (search_pattern, search_pattern))
+            
+            results = []
+            for row in cursor.fetchall():
+                series_name = row[0]
+                updated_at = row[1]
+                aliases = row[2].split('|') if row[2] else []
+                results.append((series_name, updated_at, aliases))
+            return results
+        except Exception as e:
+            logging.error(f"Error searching series with aliases: {e}")
+            return []
+
     def on_search(self, event=None):
-        """Handle search input - FIXED VERSION"""
         search_term = self.search_var.get().strip()
         if search_term:
-            results = series_db.search_series(search_term)
-            # Convert to format expected by populate_tree and load aliases
-            results_with_aliases = []
-            for series_name, updated_at in results:
-                aliases = series_db.load_series_aliases(series_name)
-                results_with_aliases.append((series_name, updated_at, aliases))
-            self.populate_tree(results_with_aliases)
-        else:
-            # Use the same method as refresh_series_list
-            results = series_db.get_all_series_with_aliases()
+            results = series_db.search_series_with_aliases(search_term)
             self.populate_tree(results)
+        else:
+            self.refresh_series_list()
 
     def edit_aliases(self):
         """Edit aliases for the selected series"""
@@ -2100,15 +1492,12 @@ class SeriesManagerDialog(tk.Toplevel):
             messagebox.showwarning("No Selection", "Please select a series to edit aliases.")
             return
         
-        # Load current aliases
         current_aliases = series_db.load_series_aliases(series_name)
         
-        # Open alias editor
         dialog = AliasEditorDialog(self, series_name, current_aliases)
         self.wait_window(dialog)
         
         if dialog.result is not None:
-            # Save the aliases
             if series_db.save_series_aliases(series_name, dialog.result):
                 messagebox.showinfo("Success", f"Aliases updated for '{series_name}'")
                 self.refresh_series_list()
@@ -2116,7 +1505,6 @@ class SeriesManagerDialog(tk.Toplevel):
                 messagebox.showerror("Error", f"Failed to update aliases for '{series_name}'")
         
     def get_selected_series(self):
-        """Get the currently selected series name"""
         selection = self.tree.selection()
         if selection:
             item = self.tree.item(selection[0])
@@ -2124,11 +1512,9 @@ class SeriesManagerDialog(tk.Toplevel):
         return None
     
     def on_series_select(self, event):
-        """Handle double-click on series - default to load to all files"""
         self.load_to_all_files()
     
     def load_to_all_files(self):
-        """Load the selected series metadata to all opened files"""
         series_name = self.get_selected_series()
         if not series_name:
             messagebox.showwarning("No Selection", "Please select a series to load.")
@@ -2140,7 +1526,6 @@ class SeriesManagerDialog(tk.Toplevel):
         self.destroy()
     
     def load_to_selected_file(self):
-        """Load the selected series metadata to selected file only"""
         series_name = self.get_selected_series()
         if not series_name:
             messagebox.showwarning("No Selection", "Please select a series to load.")
@@ -2152,21 +1537,18 @@ class SeriesManagerDialog(tk.Toplevel):
         self.destroy()
     
     def match_current_file(self):
-        """Match current file with series DB based on filename"""
         self.selected_series = None
         self.load_to_all = False
         self.match_mode = True
         self.destroy()
     
     def match_all_files(self):
-        """Match all files with series DB based on filenames"""
         self.selected_series = None
         self.load_to_all = True
         self.match_mode = True
         self.destroy()
     
     def delete_selected_series(self):
-        """Delete the selected series"""
         series_name = self.get_selected_series()
         if not series_name:
             messagebox.showwarning("No Selection", "Please select a series to delete.")
@@ -2179,23 +1561,24 @@ class SeriesManagerDialog(tk.Toplevel):
             else:
                 messagebox.showerror("Error", f"Failed to delete '{series_name}'")
 
-class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
+class MetadataGUI(tkdnd.Tk):
     def __init__(self):
         super().__init__()
         self.title("CBZ Metadata Manager")
         self.geometry("1600x1000")
         self.minsize(1200, 800)
+        
         self._progress_lock = Lock()
         self._metadata_lock = Lock()
-        self._cbz_paths_lock = Lock()  # Lock for thread-safe cbz_paths access  # NEW: Protect file_metadata dictionary
+        self._cbz_paths_lock = Lock()
         
-        self.local_only_mode = tk.BooleanVar(value=False)
-        self.metadata_mode = tk.StringVar(value="batch")  # "batch" or "individual"
-        self.individual_metadata_cache = {}  # Store individual metadata results
-        self.batch_processing = False  # Flag to track batch operations
+        self.metadata_mode = tk.StringVar(value="batch")
+        self.individual_metadata_cache = {}
+        self.batch_processing = False
         self.title_var = tk.StringVar()
         self.dropdown_selection_per_file = {}
         self.bulk_edit_enabled = tk.BooleanVar(value=False)
+        self.use_folder_name_var = tk.BooleanVar(value=False)
 
         self.cbz_paths = []
         self.file_metadata = {}
@@ -2203,94 +1586,29 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         self.current_index = 0  
         self.metadata_options = []
              
-        self.fields = [
-            "Title", "Series", "LocalizedSeries", "AgeRating", "Number", "Count", "Volume", 
-            "PageCount", "Summary", "Year", "Month", "Day", "Writer", "Penciller", "Inker", 
-            "Colorist", "Letterer", "CoverArtist", "Editor", "Translator", "Publisher", 
-            "Imprint", "Genre", "Tags", "LanguageISO", "Web", "Notes", "Format", "Characters", 
-            "CommunityRating", "Review", "AlternateSeries", "AlternateNumber", "AlternateCount", 
-            "Teams", "Locations", "ScanInformation", "StoryArc", "StoryArcNumber", "SeriesGroup", 
-            "MainCharacterOrTeam"
-        ]
-      
-        # Field tooltips dictionary
-        self.field_tooltips = {
-            "Title": "The title of this specific issue or volume (e.g., 'Attack on Titan #1')",
-            "Series": "The name of the manga/comic series (e.g., 'Attack on Titan')",
-            "LocalizedSeries": "Series name in local language or alternate region name",
-            "Number": "Issue number within the series (e.g., 1, 2, 3.5)",
-            "Count": "Total number of issues in the series (if known)",
-            "Volume": "Volume number for collected editions or multi-volume series",
-            "Summary": "Brief description or synopsis of this issue's content",
-            "Notes": "Additional notes about this issue (scanning info, version, etc.)",
-            "Year": "Publication year (YYYY format)",
-            "Month": "Publication month (1-12)",
-            "Day": "Publication day (1-31)",
-            "Writer": "Story writer(s) - separate multiple names with commas",
-            "Penciller": "Artist who drew the pencil artwork",
-            "Inker": "Artist who inked over the pencil work",
-            "Colorist": "Artist who colored the artwork",
-            "Letterer": "Person who added text/dialogue to the pages",
-            "CoverArtist": "Artist who created the cover artwork",
-            "Editor": "Editor(s) who worked on this issue",
-            "Translator": "Person who translated the work (for localized content)",
-            "Publisher": "Publishing company (e.g., 'Kodansha', 'Viz Media')",
-            "Imprint": "Specific imprint or label under the publisher",
-            "Genre": "Genre classification (e.g., 'Action', 'Romance', 'Horror')",
-            "Tags": "Descriptive tags - separate with commas (e.g., 'supernatural, school, drama')",
-            "LanguageISO": "Language code (e.g., 'en' for English, 'ja' for Japanese)",
-            "Web": "Related website URL or online resource",
-            "PageCount": "Total number of pages in this issue",
-            "CommunityRating": "User rating (typically 1-5 or 1-10 scale)",
-            "Review": "Review text or comments about this issue",
-            "AlternateSeries": "Alternate or related series name",
-            "AlternateNumber": "Issue number in alternate numbering system",
-            "AlternateCount": "Total count in alternate numbering system",
-            "Format": "Publication format (e.g., 'TPB', 'One-Shot', 'Annual')",
-            "Characters": "Characters featured - separate with commas",
-            "Teams": "Teams or groups featured - separate with commas",
-            "Locations": "Key locations or settings - separate with commas",
-            "ScanInformation": "Information about the scan source or quality",
-            "StoryArc": "Name of the story arc this issue belongs to",
-            "StoryArcNumber": "Position of this issue within the story arc",
-            "SeriesGroup": "Group or collection this series belongs to",
-            "MainCharacterOrTeam": "Primary character or team for this series",
-            "AgeRating": "Content rating indicating appropriate age group"
-        }
-        
-        # Dropdown options for special fields
-        self.age_rating_options = [
-            "Unknown", "Rating Pending", "Early Childhood", "Everyone", "G", "Everyone 10+", 
-            "PG", "Kids to Adults", "Teen", "MA15+", "Mature 17+", "M", "R18+", 
-            "Adults Only 18+", "X18+"
-        ]
-        
-        self.format_options = [
-            "Special", "Reference", "Director's Cut", "Box Set", "Box-Set", "Annual", 
-            "Anthology", "Epilogue", "One Shot", "One-Shot", "Prologue", "TPB", 
-            "Trade Paper Back", "Omnibus", "Compendium", "Absolute", "Graphic Novel", 
-            "GN", "FCBD"
-        ]
+        # Link class variables to global configurations
+        self.fields = METADATA_FIELDS
+        self.field_tooltips = FIELD_TOOLTIPS
+        self.age_rating_options = AGE_RATING_OPTIONS
+        self.format_options = FORMAT_OPTIONS
         
         self.before_entries = {}
         self.after_entries = {}
         self.dropdown_var = tk.StringVar()
         self.title_entry = tk.StringVar()
+        
         self.create_widgets()
         
-        # Center the main window AFTER all widgets are created
         self.update_idletasks()
         center_window(self, 1600, 1000)
 
     def setup_drag_drop(self):
         """Setup drag and drop functionality"""
-        # Enable drag and drop for the file listbox
         self.file_listbox.drop_target_register(tkdnd.DND_FILES)
         self.file_listbox.dnd_bind('<<Drop>>', self.on_drop)
         self.file_listbox.dnd_bind('<<DragEnter>>', self.on_drag_enter)
         self.file_listbox.dnd_bind('<<DragLeave>>', self.on_drag_leave)
         
-        # Also enable for the main window as a fallback
         self.drop_target_register(tkdnd.DND_FILES)
         self.dnd_bind('<<Drop>>', self.on_drop)
         self.dnd_bind('<<DragEnter>>', self.on_drag_enter)
@@ -2310,11 +1628,9 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
     def on_drop(self, event):
         """Handle dropped files/folders - direct loading without popups"""
         try:
-            # Reset visual feedback
             if hasattr(self, 'file_listbox'):
                 self.file_listbox.configure(bg='white')
             
-            # Get dropped files/folders
             dropped_items = self.tk.splitlist(event.data)
             
             cbz_files = []
@@ -2323,15 +1639,12 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             
             for item in dropped_items:
                 if os.path.isfile(item):
-                    # It's a file - check if it's a CBZ
                     if item.lower().endswith('.cbz'):
                         cbz_files.append(item)
                     else:
-                        # Collect invalid files for logging
                         invalid_files.append(os.path.basename(item))
                 
                 elif os.path.isdir(item):
-                    # It's a folder - scan for CBZ files recursively
                     folder_cbz_count = 0
                     for root, dirs, files in os.walk(item):
                         for file in files:
@@ -2341,7 +1654,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                     
                     folders_processed += 1
                     
-                    # Log folder processing results
                     folder_name = os.path.basename(item)
                     if folder_cbz_count > 0:
                         print(f"Found {folder_cbz_count} CBZ files in folder: {folder_name}")
@@ -2399,27 +1711,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             # For Text widgets, prevent selection copying to primary selection
             widget.bind("<Button-1>", lambda e: widget.after_idle(lambda: widget.selection_clear() if hasattr(widget, 'selection_clear') else None))
 
-    def get_field_value_for_xml(self, field):
-        """Get field value properly formatted for XML insertion"""
-        widget = self.after_entries[field]
-        
-        if isinstance(widget, ttk.Combobox):
-            return widget.get().strip()
-        elif isinstance(widget, tk.Text):
-            content = widget.get("1.0", tk.END)
-            # Remove the automatic newline that Text widget adds at the end
-            if content.endswith('\n'):
-                content = content[:-1]
-            
-            # Special handling for Web field - convert line breaks to comma-separated
-            if field == "Web":
-                # Split by any whitespace, filter empty strings, join with commas
-                urls = [url.strip() for url in content.split() if url.strip()]
-                content = ', '.join(urls)
-            
-            return content.strip()
-        else:
-            return widget.get().strip()
             
     def create_widgets(self):
         main_frame = ttk.Frame(self)
@@ -2439,11 +1730,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         self.file_listbox = tk.Listbox(file_list_frame, height=4)
         self.file_listbox.pack(side='left', fill='both', expand=True)
         self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
-        ToolTip(self.file_listbox, 
-                "List of CBZ files for processing\n\n"
-                "Click to select a file for editing\n"
-                "Drag & drop CBZ files or folders here\n"
-                "Supports recursive folder scanning")
 
         file_scroll = ttk.Scrollbar(file_list_frame, orient='vertical', command=self.file_listbox.yview)
         file_scroll.pack(side='right', fill='y')
@@ -2476,10 +1762,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         individual_radio.pack(anchor='w')
         ToolTip(individual_radio, "Use different metadata for each file based on filename matching")
 
-        local_only_check = ttk.Checkbutton(top_frame, text="Local Only Mode (No API requests)", variable=self.local_only_mode)
-        local_only_check.pack(anchor='w', pady=(2, 0))
-        ToolTip(local_only_check, "Enable to work only with local database, disable online metadata fetching")
-
         ttk.Label(title_frame, text="Manga Title:").pack(anchor='w')
         title_entry_frame = ttk.Frame(title_frame)
         title_entry_frame.pack(fill='x')
@@ -2490,15 +1772,15 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         self.disable_middle_click_paste(self.title_entry)
         ToolTip(self.title_entry, "Enter the manga/comic series title to search for metadata")
 
-        # Metadata fetch buttons with tooltips
+        # Metadata fetch buttons with tooltips        
         fetch_anilist_btn = ttk.Button(title_entry_frame, text="Fetch AniList", command=self.fetch_anilist_metadata_gui)
         fetch_anilist_btn.pack(side='right', padx=(5, 0))
         ToolTip(fetch_anilist_btn, "Fetch metadata from AniList database")
 
-        refetch_btn = ttk.Button(title_entry_frame, text="Re-Fetch This File", command=self.fetch_metadata_for_current_file)
+        refetch_btn = ttk.Button(title_entry_frame, text="Re-Fetch This File/Series", command=self.fetch_metadata_for_current_file)
         refetch_btn.pack(side='right', padx=(5, 0))
-        ToolTip(refetch_btn, "Re-fetch metadata for the currently selected file")
-        
+        ToolTip(refetch_btn, "Re-fetch metadata for the currently selected file/all files in a series.")
+                        
         fetch_metadata_btn = ttk.Button(title_entry_frame, text="Fetch Metadata", command=self.fetch_metadata_smart)
         fetch_metadata_btn.pack(side='right', padx=(5, 0))
         ToolTip(fetch_metadata_btn, "Search for and fetch metadata from online sources")
@@ -2514,7 +1796,7 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         ttk.Label(series_db_frame, text="Series Database:", font=('TkDefaultFont', 9, 'bold')).pack(side='left')
         
         # Series database buttons with tooltips
-        save_aliases_btn = ttk.Button(series_db_frame, text="Save Series + Aliases", command=self.save_current_series_with_aliases)
+        save_aliases_btn = ttk.Button(series_db_frame, text="Save Series + Aliases", command=lambda: self.save_current_series(prompt_aliases=True))
         save_aliases_btn.pack(side='left', padx=(10, 5))
         ToolTip(save_aliases_btn, "Save current series metadata to database with alias editing")
         
@@ -2526,12 +1808,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         load_series_btn.pack(side='left', padx=(0, 5))
         ToolTip(load_series_btn, "Load previously saved series metadata from database")
         
-        manage_series_btn = ttk.Button(series_db_frame, text="Manage Series", command=self.open_series_manager)
-        manage_series_btn.pack(side='left', padx=(0, 5))
-        ToolTip(manage_series_btn, "Open series database manager to view, edit, and organize saved series")
-        
-        ttk.Separator(series_db_frame, orient='vertical').pack(side='left', fill='y', padx=5)
-        
         match_file_btn = ttk.Button(series_db_frame, text="Match File", command=self._match_current_file_with_db)
         match_file_btn.pack(side='left', padx=(0, 5))
         ToolTip(match_file_btn, "Try to match current file with saved series using filename analysis")
@@ -2540,38 +1816,75 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         match_all_btn.pack(side='left', padx=(0, 5))
         ToolTip(match_all_btn, "Try to match all files with saved series using filename analysis")
 
+        folder_name_chk = ttk.Checkbutton(series_db_frame, text="Use Folder Name as Series", variable=self.use_folder_name_var, command=self._toggle_folder_name_mode)
+        folder_name_chk.pack(side='right', padx=10)
+        ToolTip(folder_name_chk, "Extract title from the parent folder name instead of the file name (e.g., for 'Bleach/Chapter 1.cbz')")
+
         self.dropdown = ttk.Combobox(top_frame, textvariable=self.dropdown_var, state='readonly', font=('TkDefaultFont', 10))
         self.dropdown.pack(fill='x', pady=(10, 0))
         self.dropdown.bind("<<ComboboxSelected>>", self.update_metadata_from_dropdown)
-        ToolTip(self.dropdown, "Select from available metadata options found during search")
-
+        ToolTip(self.dropdown, "Select from available metadata options found during search")      
+        
         nav_frame = ttk.Frame(main_frame)
         nav_frame.pack(fill='x', pady=(0, 10))
 
         # Navigation and utility buttons with tooltips
-        prev_btn = ttk.Button(nav_frame, text="Previous", command=self.prev_file)
+        prev_btn = ttk.Button(nav_frame, text="Previous", command=lambda: self.navigate_file(-1))
         prev_btn.pack(side='left', padx=(0, 5))
         ToolTip(prev_btn, "Navigate to the previous file in the list")
         
-        next_btn = ttk.Button(nav_frame, text="Next", command=self.next_file)
+        next_btn = ttk.Button(nav_frame, text="Next", command=lambda: self.navigate_file(1))
         next_btn.pack(side='left', padx=(0, 15))
         ToolTip(next_btn, "Navigate to the next file in the list")
         
-        auto_fill_btn = ttk.Button(nav_frame, text="Auto-Fill Volume", command=self.fill_volume_info)
+        auto_fill_btn = ttk.Button(nav_frame, text="Auto-Fill Volume", command=lambda: self.fill_metadata_field("volume"))
         auto_fill_btn.pack(side='left', padx=(0, 5))
         ToolTip(auto_fill_btn, "Automatically extract volume/issue numbers from filename")
         
-        auto_fill_chapter_btn = ttk.Button(nav_frame, text="Auto-Fill Chapter", command=self.fill_chapter_info)
+        auto_fill_chapter_btn = ttk.Button(nav_frame, text="Auto-Fill Chapter", command=lambda: self.fill_metadata_field("chapter"))
         auto_fill_chapter_btn.pack(side='left', padx=(0, 5))
         ToolTip(auto_fill_chapter_btn, "Automatically extract chapter/issue numbers from filename")
         
-        count_pages_btn = ttk.Button(nav_frame, text="Count Pages", command=self.fill_page_count)
+        count_pages_btn = ttk.Button(nav_frame, text="Count Pages", command=lambda: self.fill_metadata_field("pages"))
         count_pages_btn.pack(side='left', padx=(0, 5))
         ToolTip(count_pages_btn, "Count and fill in the number of pages in the CBZ file")
         
+        extract_title_btn = ttk.Button(nav_frame, text="Extract Title", command=self.fill_title_from_filename)
+        extract_title_btn.pack(side='left', padx=(0, 5))
+        ToolTip(extract_title_btn, "Extract Chapter/Volume Name from filename (text after Cxxx/Vxxx)")
+        
+        do_all_alt_btn = ttk.Button(nav_frame, text="Do All - Fetch Anilist", command=self.do_all_operations_alt)
+        do_all_alt_btn.pack(side='right', padx=(5, 0))
+        ToolTip(do_all_alt_btn, "Execute all operations: Auto-fill Volume/Chapter, Count Pages, Extract Title and Save")
+        
+        do_all_btn = ttk.Button(nav_frame, text="Do All", command=self.do_all_operations)
+        do_all_btn.pack(side='right', padx=(5, 0))
+        ToolTip(do_all_btn, "Execute all operations: Fetch AniList, Auto-fill Volume/Chapter, Count Pages, Extract Title and Save")
+                
         bulk_edit_check = ttk.Checkbutton(nav_frame, text="Bulk Edit All Files", variable=self.bulk_edit_enabled)
         bulk_edit_check.pack(side='right')
         ToolTip(bulk_edit_check, "When enabled, changes apply to all files instead of just the current file")
+
+        self.button_frame = ttk.Frame(main_frame)  # Store reference for drag/drop
+        self.button_frame.pack(fill='x')
+
+        # Main action buttons with tooltips
+        
+        insert_btn = ttk.Button(self.button_frame, text="Insert Metadata into All CBZs", command=self.insert_metadata, style='Accent.TButton')
+        insert_btn.pack(side='right', padx=(0, 15))
+        ToolTip(insert_btn, "Apply the current metadata to all selected CBZ files")
+
+        refresh_meta_btn = ttk.Button(self.button_frame, text="Refresh Metadata (Web ID)", command=self.refresh_metadata_from_web_url)
+        refresh_meta_btn.pack(side='right', padx=(0, 10))
+        ToolTip(refresh_meta_btn, "Fetches Metadata directly from Local Dump using the Mangabaka URL in the Web field from existing ComicInfo for all files.")
+        
+        copy_all_btn = ttk.Button(self.button_frame, text="Copy All Fields", command=self.copy_all_fields)
+        copy_all_btn.pack(side='left', padx=(0, 5))
+        ToolTip(copy_all_btn, "Copy all original metadata values to the updated fields")
+        
+        clear_all_btn = ttk.Button(self.button_frame, text="Clear All Fields", command=self.clear_all_fields)
+        clear_all_btn.pack(side='left', padx=(0, 5))
+        ToolTip(clear_all_btn, "Clear all metadata fields (both original and updated)")
 
         metadata_frame = ttk.LabelFrame(main_frame, text="Metadata Editor", padding=5)
         metadata_frame.pack(fill='both', expand=True, pady=(0, 10))
@@ -2661,23 +1974,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         scrollbar.bind('<Enter>', _bind_to_mousewheel) 
         scrollbar.bind('<Leave>', _unbind_from_mousewheel)
 
-        self.button_frame = ttk.Frame(main_frame)  # Store reference for drag/drop
-        self.button_frame.pack(fill='x')
-
-        # Main action buttons with tooltips
-        insert_btn = ttk.Button(self.button_frame, text="Insert Metadata into All CBZs", command=self.insert_metadata, style='Accent.TButton')
-        insert_btn.pack(side='left', padx=(0, 10))
-        insert_btn.bind("<Button-3>", lambda e: self._reset_thread_count())  # Right-click
-        ToolTip(insert_btn, "Left Click - Apply the current metadata to all selected CBZ files, Right Click - Modify CPU Thread Setting")
-        
-        copy_all_btn = ttk.Button(self.button_frame, text="Copy All Fields", command=self.copy_all_fields)
-        copy_all_btn.pack(side='left', padx=(0, 5))
-        ToolTip(copy_all_btn, "Copy all original metadata values to the updated fields")
-        
-        clear_all_btn = ttk.Button(self.button_frame, text="Clear All Fields", command=self.clear_all_fields)
-        clear_all_btn.pack(side='left', padx=(0, 5))
-        ToolTip(clear_all_btn, "Clear all metadata fields (both original and updated)")
-
         # Set up drag and drop AFTER all widgets are created
         self.setup_drag_drop()
         
@@ -2709,11 +2005,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                 current_file = self.cbz_paths[self.current_index]
                 if current_file in self.file_metadata:
                     self.file_metadata[current_file][field] = value
-
-    def adjust_text_widget_height(self, widget, content):
-        """Resize height of text widget based on line count (max 6 lines)"""
-        lines = content.count("\n") + 1
-        widget.configure(height=min(lines, 6))
                 
     def populate_dropdown_for_current_file(self):
         """Populate metadata dropdown based on current file (individual mode)"""
@@ -2728,7 +2019,7 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
 
             dropdown_values = []
             for meta in self.metadata_options:
-                title_text = meta.get("Title", "Unknown")
+                title_text = meta.get('Series') or meta.get('Title') or 'Unknown'
                 type_text = meta.get("type", "")
                 year_text = meta.get("Year", "")
                 content_rating_text = meta.get("content_rating", "")
@@ -2749,10 +2040,10 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             selected_idx = self.dropdown_selection_per_file.get(current_file, 0)
             if selected_idx < len(dropdown_values):
                 self.dropdown.set(dropdown_values[selected_idx])
-                self.update_metadata_from_dropdown()
+                # REMOVED: self.update_metadata_from_dropdown() <-- This was erasing your edits!
             elif dropdown_values:
                 self.dropdown.set(dropdown_values[0])
-                self.update_metadata_from_dropdown()
+                # REMOVED: self.update_metadata_from_dropdown() <-- This was erasing your edits!
             else:
                 self.dropdown.set("No matches found")
                 
@@ -2775,6 +2066,7 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                     cbz_files.append(os.path.join(root, f))
 
         self._process_cbz_files(cbz_files)
+
         
     def _process_cbz_files(self, paths):
         if not paths:
@@ -2786,94 +2078,158 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             self.file_listbox.delete(0)
             self.file_listbox.configure(fg='black')
 
-        self.cbz_paths = list(paths)
+        # Use natural sort so v2 comes before v10
+        self.cbz_paths = sorted(paths, key=natural_sort_key)
+        
+        # 1. OPTIMIZATION: Clear and update the Listbox instantly using a Tuple
         self.file_listbox.delete(0, tk.END)
+        display_names = []
+        for path in self.cbz_paths:
+            folder_name = os.path.basename(os.path.dirname(path))
+            file_name = os.path.basename(path)
+            if folder_name:
+                display_names.append(f"{folder_name}/{file_name}")
+            else:
+                display_names.append(file_name)
+        display_names = tuple(display_names)
+        
+        # In Tkinter, updating the 'listvariable' or doing a bulk insert is near-instant
+        self.file_listbox.insert(tk.END, *display_names)
+        
         self.file_metadata.clear()
         self.original_metadata.clear()
 
-        first_title = auto_extract_title(os.path.basename(self.cbz_paths[0]))
-        self.title_var.set(first_title)
+        # Update title var instantly using the full path now
+        first_title = self._extract_title_from_filename(self.cbz_paths[0])
+        if first_title:
+            first_title = first_title.translate(APOSTROPHE_MAP)
+            self.title_var.set(first_title)
 
-        for path in self.cbz_paths:
-            self.file_listbox.insert(tk.END, os.path.basename(path))
-            meta = {field: "" for field in self.fields}
-            self.file_metadata[path] = meta.copy()
-
-            try:
-                with zipfile.ZipFile(path, 'r') as cbz:
-                    if "ComicInfo.xml" in cbz.namelist():
-                        with cbz.open("ComicInfo.xml") as xml_file:
-                            tree = ET.parse(xml_file)
-                            root = tree.getroot()
-                            for field in self.fields:
-                                element = root.find(field)
-                                if element is not None and element.text:
-                                    meta[field] = element.text.strip()
-            except Exception as e:
-                logging.warning(f"Failed to read ComicInfo.xml from {path}: {e}")
-
-            self.original_metadata[path] = meta.copy()
+        # 2. OPTIMIZATION: Dictionary comprehension is faster than a standard loop
+        empty_meta = {field: "" for field in self.fields}
+        self.file_metadata = {path: empty_meta.copy() for path in self.cbz_paths}
+        self.original_metadata = {path: empty_meta.copy() for path in self.cbz_paths}
 
         if self.cbz_paths:
             self.file_listbox.select_set(0)
             self.current_index = 0
+            # Show empty metadata instantly
             self.load_metadata(0)
+            
+            Thread(target=self._background_xml_loader, daemon=True).start()
 
-    def clear_all_fields(self):
-        """Clear all metadata fields for current file"""
+    def _background_xml_loader(self):
+        """Reads ComicInfo.xml from all loaded zips in the background without freezing GUI"""
+        for path in self.cbz_paths:
+            try:
+                with zipfile.ZipFile(path, 'r') as cbz:
+                    # Fast check using set intersection
+                    if "ComicInfo.xml" in set(cbz.namelist()):
+                        with cbz.open("ComicInfo.xml") as xml_file:
+                            tree = ET.parse(xml_file)
+                            root = tree.getroot()
+                            
+                            found_data = False
+                            meta_update = {}
+                            for field in self.fields:
+                                element = root.find(field)
+                                if element is not None and element.text:
+                                    meta_update[field] = element.text.strip()
+                                    found_data = True
+                            
+                            if found_data:
+                                # ONLY update original_metadata. Leave file_metadata blank for the UI.
+                                self.original_metadata[path].update(meta_update)
+                                
+                                # If this is the currently selected file, tell Tkinter to refresh
+                                if path == self.cbz_paths[self.current_index]:
+                                    self.after(0, lambda: self.load_metadata(self.current_index))
+            except Exception as e:
+                logging.warning(f"Failed to read ComicInfo.xml from {path}: {e}")
+
+    def save_current_series(self, prompt_aliases=False):
+        """Save current series metadata to database, optionally prompting for aliases"""
         if not self.cbz_paths:
+            messagebox.showerror("Error", "No CBZ files loaded")
             return
             
-        for field in self.fields:
-            if field in ["AgeRating", "Format"]:
-                self.after_entries[field].set("")
-            else:
-                self.after_entries[field].delete("1.0", tk.END)
-            if self.current_index < len(self.cbz_paths):
-                current_file = self.cbz_paths[self.current_index]
-                self.file_metadata[current_file][field] = ""
-                
-    def save_current_series(self):
-            """Save current series metadata to database"""
-            if not self.cbz_paths:
-                messagebox.showerror("Error", "No CBZ files loaded")
-                return
-            
-            # Get series name from current metadata
+        series_to_save = {}
+        
+        if self.metadata_mode.get() == "batch":
+            # BATCH MODE: Just grab the currently selected series
             current_file = self.cbz_paths[self.current_index] if self.current_index < len(self.cbz_paths) else self.cbz_paths[0]
             current_metadata = self.file_metadata.get(current_file, {})
             series_name = current_metadata.get('Series', '').strip()
             
             if not series_name:
-                # Prompt for series name
                 series_name = tk.simpledialog.askstring(
-                    "Series Name", 
-                    "Enter series name:",
-                    initialvalue=self.title_entry.get().strip()
+                    "Series Name", "Enter series name:", initialvalue=self.title_entry.get().strip()
                 )
                 if not series_name or not series_name.strip():
                     messagebox.showwarning("Warning", "Series name is required")
                     return
                 series_name = series_name.strip()
+                
+            series_to_save[series_name] = current_metadata
             
-            # Create series metadata (use metadata from first file as template)
+        else:
+            # INDIVIDUAL MODE: Extract ALL unique series loaded in the app
+            for path in self.cbz_paths:
+                meta = self.file_metadata.get(path, {})
+                series_name = meta.get('Series', '').strip()
+                
+                # If the user hasn't fetched metadata for a file yet, 'Series' might be empty.
+                # Fallback to the extracted title from the file/folder name safely.
+                if not series_name:
+                    series_name = self._extract_title_from_filename(path)
+                    
+                if series_name:
+                    # We only keep one metadata snapshot per unique series name
+                    if series_name not in series_to_save:
+                        series_to_save[series_name] = meta
+
+        if not series_to_save:
+            messagebox.showwarning("Warning", "No valid series names found to save.")
+            return
+
+        saved_count = 0
+        failed_count = 0
+        
+        # Save every unique series found
+        for series_name, current_metadata in series_to_save.items():
+            # Create series metadata template and strip file-specific data
             series_metadata = current_metadata.copy()
-            
-            # Remove file-specific fields
-            file_specific_fields = ['Number', 'Volume', 'PageCount']
-            for field in file_specific_fields:
+            for field in ['Number', 'Volume', 'PageCount', 'Title']:
                 if field in series_metadata:
                     series_metadata[field] = ""
             
             try:
                 if series_db.save_series_metadata(series_name, series_metadata):
-                    print("Success", f"Series '{series_name}' saved to database")
+                    saved_count += 1
+                    # If triggered by the "Save with Aliases" button, show the dialog
+                    if prompt_aliases:
+                        current_aliases = series_db.load_series_aliases(series_name)
+                        dialog = AliasEditorDialog(self, series_name, current_aliases)
+                        self.wait_window(dialog)
+                        # If user hits Cancel, dialog.result is None, so it safely skips
+                        if dialog.result is not None:
+                            series_db.save_series_aliases(series_name, dialog.result)
                 else:
-                    messagebox.showerror("Error", f"Failed to save series '{series_name}'")
+                    failed_count += 1
             except Exception as e:
-                logging.error(f"Error saving series: {e}")
-                messagebox.showerror("Error", f"Failed to save series: {str(e)}")
+                logging.error(f"Error saving series '{series_name}': {e}")
+                failed_count += 1
                 
+        # Final User Feedback
+        if saved_count > 0:
+            if len(series_to_save) == 1:
+                print(f"Success: Series '{list(series_to_save.keys())[0]}' saved to database")
+            else:
+                messagebox.showinfo("Bulk Save Complete", f"Successfully saved {saved_count} unique series to the database.")
+        
+        if failed_count > 0:
+            messagebox.showwarning("Warning", f"Failed to save {failed_count} series. Check logs.")
+            
     def load_series_from_db(self):
         """Load series metadata from database"""
         dialog = SeriesManagerDialog(self)
@@ -2934,77 +2290,17 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             else:
                 messagebox.showerror("Error", f"Failed to load series metadata for '{dialog.selected_series}'")
                 
-    def save_current_series_with_aliases(self):
-        """Save current series metadata to database with aliases"""
-        if not self.cbz_paths:
-            messagebox.showerror("Error", "No CBZ files loaded")
-            return
-        
-        # Get series name from current metadata
-        current_file = self.cbz_paths[self.current_index] if self.current_index < len(self.cbz_paths) else self.cbz_paths[0]
-        current_metadata = self.file_metadata.get(current_file, {})
-        series_name = current_metadata.get('Series', '').strip()
-        
-        if not series_name:
-            # Prompt for series name
-            series_name = tk.simpledialog.askstring(
-                "Series Name", 
-                "Enter series name:",
-                initialvalue=self.title_entry.get().strip()
-            )
-            if not series_name or not series_name.strip():
-                messagebox.showwarning("Warning", "Series name is required")
-                return
-            series_name = series_name.strip()
-        
-        # Create series metadata
-        series_metadata = current_metadata.copy()
-        
-        # Remove file-specific fields
-        file_specific_fields = ['Number', 'Volume', 'PageCount']
-        for field in file_specific_fields:
-            if field in series_metadata:
-                series_metadata[field] = ""
-        
-        try:
-            # Save series metadata
-            if series_db.save_series_metadata(series_name, series_metadata):
-                # Open alias editor for new series
-                current_aliases = series_db.load_series_aliases(series_name)
-                dialog = AliasEditorDialog(self, series_name, current_aliases)
-                self.wait_window(dialog)
-                
-                if dialog.result is not None:
-                    series_db.save_series_aliases(series_name, dialog.result)
-                
-                print("Success", f"Series '{series_name}' saved to database")
-            else:
-                messagebox.showerror("Error", f"Failed to save series '{series_name}'")
-        except Exception as e:
-            logging.error(f"Error saving series: {e}")
-            messagebox.showerror("Error", f"Failed to save series: {str(e)}")
-
-    # Update the _find_best_match method to use aliases:
-    def _find_best_match(self, extracted_title, all_series):
-        """Find the best matching series title from the database (now includes aliases)"""
-        if not extracted_title or not all_series:
-            return None
-        
-        # Clean the extracted title for comparison
-        cleaned_extracted = self._clean_title_for_matching(extracted_title)
-        normalized_extracted = self._normalize_for_comparison(cleaned_extracted)
-        
-        # Get all series with their aliases
+    def _build_series_variants_cache(self, all_series):
+        """Build a cached, pre-normalized dictionary of all series variants to eliminate DB hits during loops"""
         series_with_variants = []
         for series_item in all_series:
             if len(series_item) == 3:
                 series_name, updated_at, aliases = series_item
             else:
-                # Fallback for old format
                 series_name = series_item[0] if isinstance(series_item, tuple) else series_item
                 aliases = []
             
-            # Load metadata for localized titles
+            # Load metadata ONCE per series
             series_metadata = series_db.load_series_metadata(series_name)
             if not isinstance(series_metadata, dict):
                 series_metadata = {'Series': series_name}
@@ -3012,134 +2308,103 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             # Collect all title variants
             all_titles = [series_name]
             
-            # Add aliases
+            # Add aliases safely
             if aliases:
-                all_titles.extend(aliases)
+                if isinstance(aliases, list):
+                    all_titles.extend(aliases)
+                elif isinstance(aliases, str):
+                    all_titles.extend([a.strip() for a in aliases.split(',') if a.strip()])
             
-            # Add LocalizedSeries from metadata
-            if series_metadata and 'LocalizedSeries' in series_metadata and series_metadata['LocalizedSeries']:
-                localized_titles = [title.strip() for title in series_metadata['LocalizedSeries'].split(',') if title.strip()]
-                all_titles.extend(localized_titles)
-            
-            # Add other alternative title fields from metadata
-            if series_metadata and isinstance(series_metadata, dict):
+            # Add LocalizedSeries and alternative titles
+            if series_metadata:
+                if series_metadata.get('LocalizedSeries'):
+                    all_titles.extend([t.strip() for t in series_metadata['LocalizedSeries'].split(',') if t.strip()])
                 for field in ['Native', 'Romaji', 'Secondary']:
                     alt_title = series_metadata.get(field, '').strip()
-                    if alt_title and alt_title not in all_titles:
+                    if alt_title:
                         all_titles.append(alt_title)
             
-            # Remove duplicates while preserving order
-            unique_titles = []
-            for title in all_titles:
-                if title not in unique_titles:
-                    unique_titles.append(title)
+            # Pre-clean and pre-normalize to save massive CPU time during the loop
+            processed_variants = []
+            unique_titles = list(dict.fromkeys(all_titles)) # Fast deduplication preserving order
             
-            series_with_variants.append((series_name, unique_titles))
+            for t in unique_titles:
+                if not t: continue
+                cleaned = self._clean_title_for_matching(t)
+                norm = self._normalize_for_comparison(cleaned)
+                processed_variants.append({'raw': t, 'normalized': norm})
+                
+            series_with_variants.append((series_name, processed_variants))
+            
+        return series_with_variants
+
+    def _find_best_match(self, extracted_title, series_with_variants):
+        """Find the best matching series title using pre-cached variants (Blazing Fast)"""
+        if not extracted_title or not series_with_variants:
+            return None
         
-        # First try exact match against all title variants (after cleaning)
-        for series_name, title_variants in series_with_variants:
-            for title_variant in title_variants:
-                cleaned_variant = self._clean_title_for_matching(title_variant)
-                if self._normalize_for_comparison(cleaned_variant) == normalized_extracted:
+        cleaned_extracted = self._clean_title_for_matching(extracted_title)
+        normalized_extracted = self._normalize_for_comparison(cleaned_extracted)
+        
+        # 1. Try Exact match against pre-normalized variants
+        for series_name, variants in series_with_variants:
+            for variant in variants:
+                if variant['normalized'] == normalized_extracted:
                     return series_name
         
-        # Then try substring matching (both ways) with cleaned titles
+        # 2. Try Substring matching (both ways)
         best_matches = []
-        
-        for series_name, title_variants in series_with_variants:
-            for title_variant in title_variants:
-                cleaned_variant = self._clean_title_for_matching(title_variant)
-                normalized_variant = self._normalize_for_comparison(cleaned_variant)
-                
-                # Check if extracted title is contained in variant title
-                if normalized_extracted in normalized_variant:
-                    score = len(normalized_variant) - len(normalized_extracted)
+        for series_name, variants in series_with_variants:
+            for variant in variants:
+                norm_variant = variant['normalized']
+                if normalized_extracted in norm_variant:
+                    score = len(norm_variant) - len(normalized_extracted)
                     best_matches.append((series_name, score, 'contains'))
-                
-                # Check if variant title is contained in extracted title
-                elif normalized_variant in normalized_extracted:
-                    score = len(normalized_extracted) - len(normalized_variant)
+                elif norm_variant in normalized_extracted:
+                    score = len(normalized_extracted) - len(norm_variant)
                     best_matches.append((series_name, score, 'contained'))
         
-        # Return the match with smallest length difference (most similar)
         if best_matches:
             best_matches.sort(key=lambda x: (x[1], x[2]))
             return best_matches[0][0]
         
-        # Finally, try fuzzy matching against all variants
-        return self._fuzzy_match_with_variants(normalized_extracted, series_with_variants)
-        
+        # 3. Try Fuzzy matching
+        return self._fuzzy_match_with_variants(normalized_extracted, series_with_variants) 
     
     def _extract_volume_from_filename(self, filename):
-        """Extract volume number from filename (class method)"""
-        filename_lower = filename.lower()
-        
-        # Try all patterns in order of likelihood
-        match = VOLUME_PATTERN.search(filename_lower)
-        if match:
-            return match.group(1)
-        
-        match = REVERSED_VOLUME_PATTERN.search(filename_lower)
-        if match:
-            return match.group(1)
-        
-        match = STANDALONE_V_PATTERN.search(filename_lower)
-        if match:
-            return match.group(1)
-        
-        return ""
-
-    
+        """Extract volume number from filename (Wrapper for global function)"""
+        # Call the global function, but ensure it returns "" instead of None
+        return extract_volume_from_filename(filename) or ""
+           
     def _clean_title_for_matching(self, title):
         """Clean title preserving ordinal numbers like '7th Time Loop'"""
-        cleaned = title
-        
-        # Remove brackets and parentheses
-        cleaned = BRACKET_CONTENT_PATTERN.sub('', cleaned)
+        cleaned = BRACKET_CONTENT_PATTERN.sub('', title)
         cleaned = PAREN_CONTENT_PATTERN.sub('', cleaned)
         
-        # Remove volume/chapter markers (word boundaries preserve ordinals)
         cleaned = VOLUME_PATTERN.sub('', cleaned)
-        cleaned = CHAPTER_PATTERN.sub('', cleaned)
-        
-        # Remove quality tags if patterns exist
-        if 'RESOLUTION_PATTERN' in globals():
-            cleaned = RESOLUTION_PATTERN.sub('', cleaned)
-        if 'QUALITY_PATTERN' in globals():
-            cleaned = QUALITY_PATTERN.sub('', cleaned)
-        
-        # Normalize whitespace
-        cleaned = WHITESPACE_PATTERN.sub(' ', cleaned).strip()
-        
-        return cleaned
-
+        cleaned = CHAPTER_PATTERN.sub('', cleaned)      
+      
+        return WHITESPACE_PATTERN.sub(' ', cleaned).strip()
     
     def _normalize_for_comparison(self, title):
         """Normalize title for comparison by removing special characters and converting to lowercase"""
-        # Remove special characters and normalize spacing
-        normalized = re.sub(r'[^\w\s]', '', title.lower())
-        normalized = ' '.join(normalized.split())
-        return normalized
+        normalized = SPECIAL_CHARS_REMOVAL.sub('', title.lower())
+        return ' '.join(normalized.split())
     
     def _fuzzy_match_with_variants(self, normalized_extracted, series_with_variants):
-        """Perform fuzzy matching against all title variants"""
+        """Perform fuzzy matching against pre-normalized variants"""
         try:
             from difflib import SequenceMatcher
-            
             best_match = None
             best_ratio = 0.0
             threshold = 0.8  # Minimum similarity threshold
             
-            for series_name, title_variants in series_with_variants:
-                for title_variant in title_variants:
-                    cleaned_variant = self._clean_title_for_matching(title_variant)
-                    normalized_variant = self._normalize_for_comparison(cleaned_variant)
-                    
-                    ratio = SequenceMatcher(None, normalized_extracted, normalized_variant).ratio()
+            for series_name, variants in series_with_variants:
+                for variant in variants:
+                    ratio = SequenceMatcher(None, normalized_extracted, variant['normalized']).ratio()
                     if ratio > best_ratio and ratio >= threshold:
                         best_ratio = ratio
                         best_match = series_name
-            
             return best_match
         except Exception as e:
             logging.error(f"Error in fuzzy matching: {e}")
@@ -3153,20 +2418,22 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         
         current_file = self.cbz_paths[self.current_index]
         filename = os.path.basename(current_file)
-        extracted_title = self._extract_title_from_filename(filename)
+        
+        # FIX: Pass the full path, not just the filename
+        extracted_title = self._extract_title_from_filename(current_file)
         
         if not extracted_title:
             messagebox.showwarning("Warning", f"Could not extract title from filename: {filename}")
             return
         
-        # Search for matching series in DB (now includes aliases)
+        # Build the cache once, then match
         all_series = series_db.get_all_series_with_aliases()
-        best_match = self._find_best_match(extracted_title, all_series)
+        series_with_variants = self._build_series_variants_cache(all_series)
+        best_match = self._find_best_match(extracted_title, series_with_variants)
         
         if best_match:
             series_metadata = series_db.load_series_metadata(best_match)
             if series_metadata:
-                # Apply to current file only
                 existing_metadata = self.file_metadata.get(current_file, {})
                 file_specific_data = {
                     'Volume': existing_metadata.get('Volume', ''),
@@ -3177,9 +2444,8 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                 self.file_metadata[current_file] = series_metadata.copy()
                 self.file_metadata[current_file].update(file_specific_data)
                 
-                # Auto-extract volume if not already set
                 if not file_specific_data['Volume']:
-                    volumes = self._extract_volume_from_filename(filename)
+                    volume = self._extract_volume_from_filename(filename)
                     if volume:
                         self.file_metadata[current_file]['Volume'] = volume
                 
@@ -3189,9 +2455,9 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                 messagebox.showerror("Error", f"Failed to load metadata for matched series '{best_match}'")
         else:
             messagebox.showinfo("No Match", f"No matching series found for '{filename}'\nExtracted title: '{extracted_title}'")
-    
+
     def _match_all_files_with_db(self):
-        """Match all files with series DB based on filenames"""
+        """Match all files with series DB based on filenames (Now highly optimized)"""
         if not self.cbz_paths:
             messagebox.showwarning("Warning", "No CBZ files loaded.")
             return
@@ -3204,21 +2470,30 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         matched_files = 0
         match_results = []
         
+        # 1. BUILD CACHE ONCE for all files (Massive performance boost)
+        series_with_variants = self._build_series_variants_cache(all_series)
+        loaded_series_metadata_cache = {}  
+        
         for cbz_path in self.cbz_paths:
             filename = os.path.basename(cbz_path)
-            extracted_title = self._extract_title_from_filename(filename)
+            
+            # FIX: Pass the full path, not just the filename
+            extracted_title = self._extract_title_from_filename(cbz_path)
             
             if not extracted_title:
-                match_results.append(f"Ã¢ÂÅ’ {filename} - Could not extract title")
+                match_results.append(f"{filename} - Could not extract title")
                 continue
             
-            # Search for matching series (now includes aliases)
-            best_match = self._find_best_match(extracted_title, all_series)
+            # 2. MATCH using pre-computed memory cache
+            best_match = self._find_best_match(extracted_title, series_with_variants)
             
             if best_match:
-                series_metadata = series_db.load_series_metadata(best_match)
+                if best_match not in loaded_series_metadata_cache:
+                    loaded_series_metadata_cache[best_match] = series_db.load_series_metadata(best_match)
+                
+                series_metadata = loaded_series_metadata_cache[best_match]
+                
                 if series_metadata:
-                    # Apply to this file
                     existing_metadata = self.file_metadata.get(cbz_path, {})
                     file_specific_data = {
                         'Volume': existing_metadata.get('Volume', ''),
@@ -3229,27 +2504,22 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                     self.file_metadata[cbz_path] = series_metadata.copy()
                     self.file_metadata[cbz_path].update(file_specific_data)
                     
-                    # Auto-extract volume if not already set
                     if not file_specific_data['Volume']:
                         volume = self._extract_volume_from_filename(filename)
                         if volume:
                             self.file_metadata[cbz_path]['Volume'] = volume
                     
                     matched_files += 1
-                    match_results.append(f"{filename} {best_match}")
+                    match_results.append(f"{filename} ➔ {best_match}")
                 else:
                     match_results.append(f"{filename} - Failed to load '{best_match}' metadata")
             else:
                 match_results.append(f"{filename} - No match found")
         
-        # Refresh display
         self.load_metadata(self.current_index)
         
-        # Show results
         result_text = f"Matching Results: {matched_files}/{len(self.cbz_paths)} files matched\n\n"
         result_text += "\n".join(match_results)
-        
-        # Show results in a scrollable dialog
         self._show_match_results(result_text)
     
     def _show_match_results(self, results_text):
@@ -3285,7 +2555,6 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         dialog.geometry("800x600")
         dialog.update_idletasks()
         center_window(dialog, 800, 600)
-
         
     def open_series_manager(self):
         """Open the series database manager"""
@@ -3391,43 +2660,35 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         lines = textwrap.wrap(text, avg_chars_per_line)
         return min(len(lines) + 1, 12)
 
-
     def copy_field(self, field):
-        """Copy value from original to updated field"""
-        if self.bulk_edit_enabled.get():
-            for file in self.cbz_paths:
-                original_value = self.original_metadata.get(file, {}).get(field, "")
-                if file in self.file_metadata:
-                    self.file_metadata[file][field] = original_value
-        else:
-            if self.current_index < len(self.cbz_paths):
-                current_file = self.cbz_paths[self.current_index]
-                original_value = self.original_metadata.get(current_file, {}).get(field, "")
-                if current_file in self.file_metadata:
-                    self.file_metadata[current_file][field] = original_value
-    
+        if not self.cbz_paths or self.current_index >= len(self.cbz_paths):
+            return
+            
+        files_to_update = self.cbz_paths if self.bulk_edit_enabled.get() else [self.cbz_paths[self.current_index]]
+        for file in files_to_update:
+            if file in self.file_metadata:
+                self.file_metadata[file][field] = self.original_metadata.get(file, {}).get(field, "")
+                
         current_file = self.cbz_paths[self.current_index]
         value = self.original_metadata.get(current_file, {}).get(field, "")
+        
         target_widget = self.after_entries.get(field)
         if isinstance(target_widget, tk.Text):
             target_widget.delete("1.0", tk.END)
             target_widget.insert("1.0", value)
-            self.after_entries[field].configure(height=min(value.count('\n') + 1, 8))
+            target_widget.configure(height=min(value.count('\n') + 1, 8))
         elif isinstance(target_widget, ttk.Combobox):
             target_widget.set(value)
     
     def clear_field(self, field):
-        """Clear a field in updated metadata"""
-        if self.bulk_edit_enabled.get():
-            for file in self.cbz_paths:
-                if file in self.file_metadata:
-                    self.file_metadata[file][field] = ""
-        else:
-            if self.current_index < len(self.cbz_paths):
-                current_file = self.cbz_paths[self.current_index]
-                if current_file in self.file_metadata:
-                    self.file_metadata[current_file][field] = ""
-    
+        if not self.cbz_paths or self.current_index >= len(self.cbz_paths):
+            return
+            
+        files_to_update = self.cbz_paths if self.bulk_edit_enabled.get() else [self.cbz_paths[self.current_index]]
+        for file in files_to_update:
+            if file in self.file_metadata:
+                self.file_metadata[file][field] = ""
+                
         widget = self.after_entries.get(field)
         if isinstance(widget, tk.Text):
             widget.delete("1.0", tk.END)
@@ -3436,25 +2697,29 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             widget.set("")
 
     def copy_all_fields(self):
-        """Copy all fields from before to after"""
         for field in self.fields:
             self.copy_field(field)
 
     def clear_all_fields(self):
-        """Clear all metadata fields for current file"""
-        if not self.cbz_paths:
-            return
-            
         for field in self.fields:
-            if field in ["AgeRating", "Format"]:
-                self.after_entries[field].set("")
-            else:
-                self.after_entries[field].delete("1.0", tk.END)
-            if self.current_index < len(self.cbz_paths):
-                current_file = self.cbz_paths[self.current_index]
-                self.file_metadata[current_file][field] = ""
+            self.clear_field(field)
 
-
+    def _sort_metadata_options(self, options):
+        """Sort metadata options to prioritize Manga over Novels while preserving match accuracy"""
+        MANGA_FORMATS = {"MANGA", "ONE_SHOT", "OEL", "MANHWA", "MANHUA", "DOUJINSHI"}
+        NOVEL_FORMATS = {"NOVEL", "LIGHT_NOVEL"}
+        
+        def _format_priority(meta):
+            fmt = str(meta.get("type", "")).upper()
+            if fmt in MANGA_FORMATS: return 0
+            elif fmt in NOVEL_FORMATS: return 2
+            return 1
+            
+        # Python's sort is stable, so it preserves the original "best title match" scoring 
+        # while grouping them by these format priorities.
+        options.sort(key=_format_priority)
+        return options
+        
     @staticmethod
     def extract_metadata(entry, filename=None):
         """Extract metadata from API response entry - WITH UPDATED PUBLISHER LOGIC and filename parsing"""
@@ -3504,7 +2769,7 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         
         web_links = MetadataGUI.clean_links('; '.join(links))
 
-        # NEW PUBLISHER LOGIC - English publisher first, rest in Imprint
+        # NEW PUBLISHER LOGIC - Use global PREFERRED_PUBLISHER_TYPES
         publishers = entry.get("publishers", [])
         pub_text = ""
         imprint_text = ""
@@ -3521,50 +2786,82 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
 
             if publisher_infos:
                 if len(publisher_infos) == 1:
-                    # Only one publisher goes to Publisher field, Imprint empty
                     pub_text = publisher_infos[0][0]
                     imprint_text = ""
                 else:
-                    # Prefer English type first
-                    english = [p for p in publisher_infos if p[1].lower() in ['english', 'en']]
-                    others = [p for p in publisher_infos if p not in english]
+                    # Prefer types defined in config
+                    preferred = [p for p in publisher_infos if p[1].lower() in PREFERRED_PUBLISHER_TYPES]
+                    others = [p for p in publisher_infos if p not in preferred]
 
-                    selected = english[0] if english else publisher_infos[0]
-                    pub_text = selected[0]  # Only the name, without (type)
+                    selected = preferred[0] if preferred else publisher_infos[0]
+                    pub_text = selected[0]
 
-                    # All go to Imprint with (type), including the selected one
                     imprint_list = [f"{name} ({ptype})" for name, ptype in publisher_infos]
                     imprint_text = ", ".join(imprint_list)
         
-        # Handle localized titles
-        roman = safe_get(entry, "romanized_title")
-        native = safe_get(entry, "native_title")
+        # ── NEW titles logic (Mangabaka API v2) ─────────────────────
+        titles_arr = entry.get("titles", [])
+        if not isinstance(titles_arr, list):
+            titles_arr = []
+
+        def _pick_series_title(titles):
+            """Pick best Series title per priority rules in config."""
+            for rule in SERIES_TITLE_PRIORITY:
+                for t in titles:
+                    if t.get("language") == rule["lang"] and t.get("is_primary") == rule["is_primary"]:
+                        if rule["trait"] is None or rule["trait"] in t.get("traits", []):
+                            return t.get("title", "")
+            return ""
+
+        def _get_localized_titles(titles):
+            """Collect all titles from allowed languages for LocalizedSeries."""
+            seen = set()
+            result = []
+            for t in titles:
+                lang = t.get("language", "")
+                title_val = t.get("title", "").strip()
+                if lang in ALLOWED_LOCALIZED_LANGUAGES and title_val and title_val not in seen:
+                    seen.add(title_val)
+                    result.append(title_val)
+            return ", ".join(result)
+
+        series_title = _pick_series_title(titles_arr)
+        localized = _get_localized_titles(titles_arr)
+
+        # Fallback to legacy title field if new titles array is absent/empty
+        if not series_title:
+            series_title = safe_get(entry, "title")
+
+        primary_title = series_title
+
+        # ── Parse Year / Month / Day from published.start_date ───────
+        start_year = ""
+        start_month = ""
+        start_day = ""
+        published_field = entry.get("published", {})
+        if isinstance(published_field, dict):
+            start_date_str = published_field.get("start_date")
+            if start_date_str and isinstance(start_date_str, str):
+                date_parts = start_date_str.split("-")
+                if len(date_parts) >= 1 and date_parts[0]:
+                    start_year = date_parts[0]
+                if len(date_parts) >= 2 and date_parts[1]:
+                    try:
+                        start_month = str(int(date_parts[1]))
+                    except ValueError:
+                        pass
+                if len(date_parts) >= 3 and date_parts[2]:
+                    try:
+                        start_day = str(int(date_parts[2]))
+                    except ValueError:
+                        pass
+
         
-        secondary_titles = entry.get("secondary_titles", {})
-        if isinstance(secondary_titles, dict):
-            en_titles = secondary_titles.get("en", [])
-            if isinstance(en_titles, list):
-                sec = ", ".join(st.get("title", "") for st in en_titles if isinstance(st, dict))
-            else:
-                sec = ""
-        else:
-            sec = ""
-            
-        localized = ", ".join(filter(None, [roman, native, sec]))
-        primary_title = safe_get(entry, "title")
-        
-        # Map content_rating to AgeRating
+        # Map content_rating to AgeRating using global map
         content_rating = safe_get(entry, "content_rating")
         age_rating = ""
         if content_rating:
-            # Simple mapping - you can expand this as needed
-            rating_map = {
-                "safe": "Everyone",
-                "suggestive": "Teen", 
-                "erotica": "Mature 17+",
-                "pornographic": "Adults Only 18+"
-            }
-            age_rating = rating_map.get(content_rating.lower(), content_rating)
+            age_rating = AGE_RATING_MAPPING.get(content_rating.lower(), content_rating)
         
         # Extract chapter number and title from filename if provided
         chapter_number = ""
@@ -3572,30 +2869,23 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         if filename:
             import os
             basename = os.path.basename(filename)
-            # Remove extension
             basename_no_ext = os.path.splitext(basename)[0]
 
-            # Extract chapter number using CHAPTER_PATTERN
             chapter_match = CHAPTER_PATTERN.search(basename_no_ext)
             if chapter_match:
                 chapter_number = chapter_match.group(1)
 
-            # Extract title from filename (basic cleanup)
             filename_title = EXTENSION_PATTERN.sub('', basename)
-            # Remove chapter/volume markers
             filename_title = CHAPTER_PATTERN.sub('', filename_title)
             filename_title = VOLUME_PATTERN.sub('', filename_title)
-            # Clean up brackets and parentheses content
             filename_title = BRACKET_CONTENT_PATTERN.sub('', filename_title)
             filename_title = PAREN_CONTENT_PATTERN.sub('', filename_title)
-            # Clean up whitespace
             filename_title = WHITESPACE_PATTERN.sub(' ', filename_title).strip()
 
-        # Use filename title as fallback if API title is not available
         final_title = primary_title if primary_title else filename_title
 
         return {
-            "Title": final_title,
+            "Title": "",
             "Series": final_title,
             "Number": chapter_number,
             "Volume": "",
@@ -3606,12 +2896,15 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             "Colorist": ", ".join(safe_list(entry.get("artists", []))),
             "Publisher": pub_text,
             "Imprint": imprint_text,
+            "GTIN": "",
             "Genre": ", ".join(safe_list(entry.get("genres", []))),
             "Tags": ", ".join(safe_list(entry.get("tags", []))),
-            "Year": safe_get(entry, "year"),
+            "Year": start_year,
+            "Month": start_month,
+            "Day": start_day,
             "LanguageISO": safe_get(entry, "lang", "en"),
             "Web": web_links,
-            "Count": (safe_get(entry, "final_volume") or safe_get(entry, "final_chapter")) if safe_get(entry, "status").lower() in ["completed", "canceled", "cancelled"] else "",
+            "Count": (safe_get(entry, "final_volume") or safe_get(entry, "total_chapters")) if safe_get(entry, "status").lower() in ["completed", "canceled", "cancelled"] else "",
             "PageCount": "",
             "Teams": "",
             "Locations": "",
@@ -3622,21 +2915,20 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
             "content_rating": safe_get(entry, "content_rating"),
             "entry_id": safe_get(entry, "id"),
             "all_titles": {
-                "primary": safe_get(entry, "title"),
-                "romanized": roman,
-                "native": native,
-                "secondary": sec
+                "primary": series_title,
+                "romanized": series_title,
+                "native": "",
+                "secondary": localized
             }
         }
 
 
     @staticmethod
     def clean_links(raw):
-        """Clean and filter web links"""
+        """Clean and filter web links using the global blacklist"""
         if not raw:
             return ""
             
-        blacklist = ['amazon.co.jp', 'ja.wikipedia.org']
         links = [link.strip() for link in re.split(r'[;,]', raw) if link.strip()]
         cleaned = []
         seen = set()
@@ -3648,8 +2940,8 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                 link = 'https://' + link
                 link_lower = 'https://' + link_lower
             
-            # Skip blacklisted domains
-            if any(bad in link_lower for bad in blacklist):
+            # Skip blacklisted domains from global config
+            if any(bad in link_lower for bad in WEB_LINK_BLACKLIST):
                 continue
                 
             # Remove duplicates
@@ -3665,21 +2957,21 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         if not text:
             return ""
         
-        # Replace HTML tags with plain text equivalents
+        # Only replace tags that affect formatting/newlines
         html_replacements = {
             '<br>': '\n', '<br/>': '\n', '<br />': '\n', '</br>': '\n',
-            '<i>': '', '</i>': '', '<b>': '', '</b>': '',
-            '<strong>': '', '</strong>': '', '<em>': '', '</em>': '',
-            '<u>': '', '</u>': '', '<p>': '\n', '</p>': '\n'
+            '<p>': '\n', '</p>': '\n'
         }
         
         cleaned = text
         for tag, replacement in html_replacements.items():
             cleaned = cleaned.replace(tag, replacement)
         
-        # Remove any remaining HTML tags and clean up whitespace
-        cleaned = HTML_TAG_PATTERN.sub( '', cleaned)
-        cleaned = re.sub(r'\n\s*\n\s*\n+', '\n\n', cleaned)
+        # Obliterate all remaining HTML tags (<i>, <b>, <span>, etc.)
+        cleaned = HTML_TAG_PATTERN.sub('', cleaned)
+        
+        # Clean up excess newlines using pre-compiled global
+        cleaned = NEWLINE_CLEANUP_PATTERN.sub('\n\n', cleaned)
         
         return cleaned.strip()
 
@@ -3698,23 +2990,9 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         with self._metadata_lock:  # Add thread safety
             self.file_metadata[current_file] = metadata
 
-    def cleanup_temp_files(self):
-        """Clean up any leftover temporary files"""
-        if not self.cbz_paths:
-            return
-        
-        for cbz_path in self.cbz_paths:
-            temp_path = cbz_path + '.tmp'
-            try:
-                os.remove(temp_path)
-                logging.info(f"Cleaned up temp file: {temp_path}")
-            except FileNotFoundError:
-                pass  # File already deleted
-            except OSError as e:
-                logging.warning(f"Could not remove temp file {temp_path}: {e}")
-            
+
     def on_file_select(self, event):
-        """Enhanced file selection handler"""
+        """Enhanced file selection handler without redundant logic"""
         selection = self.file_listbox.curselection()
         if not selection:
             return
@@ -3722,37 +3000,16 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         self.save_current_metadata()
         self.load_metadata(selection[0])
         self.populate_dropdown_for_current_file()
-    
+
+        # --- ADD THIS NEW BLOCK TO FIX THE TITLE SEARCH BAR ---
         current_file = self.cbz_paths[selection[0]]
-    
-        if self.metadata_mode.get() == "individual" and current_file in self.individual_metadata_cache:
-            cache_data = self.individual_metadata_cache[current_file]
-            self.metadata_options = cache_data.get('options', [])
-    
-            dropdown_values = []
-            for meta in self.metadata_options:
-                title_text = meta.get("Title", "Unknown")
-                type_text = meta.get("type", "")
-                year_text = meta.get("Year", "")
-                content_rating_text = meta.get("content_rating", "")
-    
-                parts = [title_text]
-                if type_text:
-                    parts.append(f"({type_text.title()})")
-                if year_text:
-                    parts.append(f"({year_text})")
-                if content_rating_text:
-                    parts.append(f"({content_rating_text.title()})")
-    
-                dropdown_values.append(" ".join(parts))
-    
-            self.dropdown['values'] = dropdown_values
-    
-            if dropdown_values:
-                self.dropdown.set(dropdown_values[0])
-                self.update_metadata_from_dropdown()
-            else:
-                self.dropdown.set("No matches found")
+        
+        # When in individual mode, clicking a new file automatically updates the Manga Title bar
+        if self.metadata_mode.get() == "individual":
+            new_title = self._extract_title_from_filename(current_file)
+            if new_title:
+                # Update the search bar with the new series name
+                self.title_var.set(new_title.translate(APOSTROPHE_MAP))
 
 
     def fetch_metadata_smart(self):
@@ -3761,74 +3018,60 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         if mode == "batch":
             self.fetch_metadata_batch_fixed()
         else:
-            # In individual mode, we should fetch for ALL files, not just current
             self.fetch_metadata_individual()
+            
 
     def fetch_metadata_batch_fixed(self):
         """FIXED version of fetch_metadata_batch - no popups"""
         title = self.title_var.get().strip()
-        if not title:
-            print("’ Error: Please enter a manga title")
-            return
-            
-        try:
-            local_only = self.local_only_mode.get()
-            
-            # Use the optimized search function
-            raw_entries = find_best_match_merge_aware(title)  # This returns raw entries
-            
-            if not raw_entries:
-                print(f"’ No metadata found for title: '{title}'")
-                return
-            
-            # Extract metadata from raw entries
-            self.metadata_options = []
-            for entry in raw_entries:
-                current_file = self.cbz_paths[self.current_index] if self.current_index < len(self.cbz_paths) else None
-                metadata = self.extract_metadata(entry, current_file)
-                self.metadata_options.append(metadata)
 
-            
-            # Update dropdown with results - FIXED LOGIC
-            dropdown_values = []
-            for i, meta in enumerate(self.metadata_options):
-                # Try different title sources in order of preference
-                title_text = (meta.get("Title") or 
-                             meta.get("all_titles", {}).get("romanized") or 
-                             meta.get("all_titles", {}).get("native") or 
-                             "Unknown")
+        title = html.unescape(title)
+        title = title.replace('‘', "'").replace('’', "'")
+        title = title.replace('“', '"').replace('”', '"')
+
+        if not title:
+            print("❗ Error: Please enter a manga title")
+            return
+
+        try:
+            self.metadata_options = get_metadata_from_dump(title)
+
+            if not self.metadata_options:
+                messagebox.showinfo("No Matches", f"No metadata found for: {title}")
+                return
                 
-                type_text = meta.get("type", "")
-                year_text = meta.get("Year", "")
-                content_rating_text = meta.get("content_rating", "")
-                
-                # Build display name
-                parts = [title_text]
-                if type_text:
-                    parts.append(f"({type_text.title()})")
-                if year_text:
-                    parts.append(f"({year_text})")
-                if content_rating_text:
-                    parts.append(f"({content_rating_text.title()})")
-                
-                display_name = " ".join(parts)
-                dropdown_values.append(display_name)
+            self.metadata_options = self._sort_metadata_options(self.metadata_options)
             
-            self.dropdown['values'] = dropdown_values
-            
-            if len(self.metadata_options) == 1:
-                # Auto-select if only one result
-                self.dropdown.set(dropdown_values[0])
+            if self.metadata_options:
+                dropdown_values = []
+                for meta in self.metadata_options:
+                    title_text = meta.get('Series') or meta.get('Title') or 'Unknown'
+                    type_text = meta.get('type', '')
+                    year_text = meta.get('Year', '')
+                    content_rating_text = meta.get('content_rating', '')
+
+                    parts = [title_text]
+                    if type_text:
+                        parts.append(f"({type_text.title()})")
+                    if year_text:
+                        parts.append(f"[{year_text}]")
+                    if content_rating_text:
+                        parts.append(f"[{content_rating_text.title()}]")
+
+                    dropdown_values.append(" ".join(parts))
+
+                self.dropdown['values'] = dropdown_values
+                self.dropdown.current(0)
                 self.update_metadata_from_dropdown()
-                print(f" Found 1 match for '{title}' - automatically selected")
-            else:
-                # Set to first option but don't auto-update
-                self.dropdown.set(dropdown_values[0])
-                print(f" Found {len(self.metadata_options)} matches for '{title}'. First option selected - use dropdown to change.")
-                
+
+                if len(self.metadata_options) == 1:
+                    print(f"✅ Found 1 match for '{title}' - automatically selected")
+                else:
+                    print(f"✅ Found {len(self.metadata_options)} matches for '{title}'. First option selected - use dropdown to change.")
+
         except Exception as e:
             logging.error(f"Error fetching metadata: {e}")
-            print(f" Failed to fetch metadata: {str(e)}")
+            print(f"❌ Failed to fetch metadata: {str(e)}")
 
 
     def fetch_metadata_individual(self):
@@ -3844,12 +3087,14 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         test_titles = []
         for cbz_path in self.cbz_paths[:3]:  # Test first 3 files
             filename = os.path.basename(cbz_path)
-            title = self._extract_title_from_filename(filename)
-            test_titles.append(f"{filename} '{title}'")
+            
+            # FIX: Pass the full path, not just the filename
+            title = self._extract_title_from_filename(cbz_path)
+            test_titles.append(f"{filename} --->'{title}'")
         
         # Show user what titles will be extracted
         preview_msg = "Will extract these titles from filenames:\n\n" + "\n".join(test_titles)
-        if total_files_count > 3:  # ← USED HERE (line 20) - now works!
+        if total_files_count > 3:
             preview_msg += f"\n... and {total_files_count - 3} more files"
         
         result = messagebox.askyesno("Confirm Title Extraction", 
@@ -3863,118 +3108,201 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         self.progress_label.pack(anchor='w')
         
         # Start fetching in background thread
-        thread = Thread(target=self._fetch_individual_threaded, daemon=True)
+        thread = Thread(target=self.fetch_individual_threaded, daemon=True)
         thread.start()
     
+    
     def fetch_metadata_for_current_file(self):
-        """Fetch metadata only for the currently selected file"""
         if not self.cbz_paths or self.current_index >= len(self.cbz_paths):
             return
-    
+
         cbz_path = self.cbz_paths[self.current_index]
         filename = os.path.basename(cbz_path)
-    
-        # Use user-entered title if available, fallback to filename
+
         title = self.title_var.get().strip()
+        
+        # ALREADY CORRECT: this one already used cbz_path!
+        base_extracted_title = self._extract_title_from_filename(cbz_path)
+        
         if not title:
-            title = self._extract_title_from_filename(filename)
-    
-        result = messagebox.askyesno("Re-Fetch Metadata",
-            f"Refetch metadata for:\n\n{filename}\n\nUsing Title: '{title}'?\n(This will overwrite previous matches)")
-    
+            title = base_extracted_title
+
+        result = messagebox.askyesno(
+            "Re-Fetch Metadata",
+            f"Refetch metadata for\n{filename}\n\nTitle: '{title}'?\n\nThis will update ALL files sharing this extracted title."
+        )
         if not result:
             return
-    
+
         try:
-            local_only = self.local_only_mode.get()
-            # Use the same function as batch mode but for individual file
-            raw_entries = find_best_match_merge_aware(title)
-            
-            if not raw_entries:
-                messagebox.showinfo("No Matches", f"No metadata found for '{title}'")
-                return
-            
-            # Extract metadata from raw entries
-            metadata_options = []
-            for entry in raw_entries:
-                metadata = self.extract_metadata(entry, cbz_path)
-                metadata_options.append(metadata)
-    
-            self.individual_metadata_cache[cbz_path] = {
-                'options': metadata_options,
-                'title_used': title
-            }
-            self.dropdown_selection_per_file[cbz_path] = 0
-            self.populate_dropdown_for_current_file()
-            print("Success", f"Updated metadata options for:\n{filename}")
+            metadata_options = get_metadata_from_dump(title)
+            print(f"\rMatches for '{title}': {len(metadata_options)}")
+
+            if metadata_options:
+                self._sort_metadata_options(metadata_options)
+
+                # Sync all files sharing this title
+                files_to_update = [cbz_path]
+                for path in self.cbz_paths:
+                    if path != cbz_path:
+                        # ALREADY CORRECT: this one already used path!
+                        path_extracted = self._extract_title_from_filename(path)
+                        path_cached_title = self.individual_metadata_cache.get(path, {}).get('title_used')
+                        
+                        if path_extracted == base_extracted_title or (title and path_cached_title == title):
+                            if path not in files_to_update:
+                                files_to_update.append(path)
+
+                best_match = metadata_options[0]
+
+                for path in files_to_update:
+                    self.individual_metadata_cache[path] = {
+                        'options': metadata_options,
+                        'title_used': title
+                    }
+                    self.dropdown_selection_per_file[path] = 0
+                    
+                    current_metadata = self.file_metadata.get(path, {field: "" for field in self.fields})
+                    file_specific_fields = ["Title", "Number", "Volume", "PageCount"]
+                    preserved_data = {f: current_metadata.get(f) for f in file_specific_fields if current_metadata.get(f)}
+                    
+                    current_metadata.update(best_match)
+                    current_metadata.update(preserved_data)
+                    self.file_metadata[path] = current_metadata
+
+                self.populate_dropdown_for_current_file()
+                self._update_file_listbox_indicators()
+                self.load_metadata(self.current_index)
+                
+                print(f"✅ Success: Updated metadata for {len(files_to_update)} files matching '{title}'")
+            else:
+                messagebox.showinfo("No Matches", f"No metadata found for: {title}")
+
         except Exception as e:
             logging.error(f"Error refetching metadata: {e}")
             messagebox.showerror("Error", f"Failed to refetch metadata: {e}")
-    
-    def _fetch_individual_threaded(self):
-        """Background thread for individual metadata fetching"""
+
+    def fetch_individual_threaded(self):
+        """Background thread for individual metadata fetching with intelligent caching"""
         try:
             total_files = len(self.cbz_paths)
             self.individual_metadata_cache = {}
             successful_fetches = 0
             failed_extractions = []
             failed_fetches = []
-    
+            
+            # CACHE: Store results for titles we've already searched this session
+            title_search_cache = {}
+
             for i, cbz_path in enumerate(self.cbz_paths):
                 filename = os.path.basename(cbz_path)
                 self.after(0, self._update_progress, i, total_files, filename)
-    
-                title = self._extract_title_from_filename(filename)
+
+                # FIX: Pass the full path, not just the filename
+                title = self._extract_title_from_filename(cbz_path)
+
                 if not title or len(title.strip()) < 2:
                     failed_extractions.append(filename)
                     continue
-    
+
                 try:
-                    local_only = self.local_only_mode.get()
-                    
-                    if local_only:
-                        # Use optimized local search
-                        raw_entries = find_best_match_merge_aware(title)
-                        
-                        if raw_entries:
-                            # Extract metadata from raw entries
-                            metadata_options = []
-                            for entry in raw_entries:
-                                metadata = self.extract_metadata(entry, cbz_path)
-                                metadata_options.append(metadata)
-                        else:
-                            metadata_options = []
+                    if title in title_search_cache:
+                        metadata_options = title_search_cache[title]
                     else:
-                        # Use the full search function (local + API)
-                        metadata_options = get_metadata_from_dump_or_api(title, local_only=local_only)
-    
-                    print(f"[R] Matches for '{title}': {len(metadata_options)}")
-    
-                    # Only cache if we found matches
+                        metadata_options = get_metadata_from_dump(title)
+                        
+                        if metadata_options:
+                            self._sort_metadata_options(metadata_options)
+                            
+                        title_search_cache[title] = metadata_options
+
                     if metadata_options:
                         self.individual_metadata_cache[cbz_path] = {
                             'options': metadata_options,
                             'title_used': title
                         }
+                        
+                        best_match = metadata_options[0]
+                        current_metadata = self.file_metadata.get(cbz_path, {field: "" for field in self.fields})
+                        current_metadata.update(best_match)
+                        self.file_metadata[cbz_path] = current_metadata
+                        
                         successful_fetches += 1
                     else:
                         failed_fetches.append(filename)
-    
-                except (ValueError, KeyError, TypeError, ConnectionError) as e:
-                    failed_fetches.append(f"{filename} (error: {str(e)})")
-                    logging.error(f"Error fetching metadata for {filename}: {e}")
+
                 except Exception as e:
                     failed_fetches.append(f"{filename} (error: {str(e)})")
-                    logging.critical(f"Unexpected error fetching metadata for {filename}: {e}", exc_info=True)
-    
-            self.after(0, self._finish_individual_fetch, successful_fetches, total_files,
-                       failed_extractions, failed_fetches)
-    
-        except (ValueError, RuntimeError) as e:
-            error_msg = f"Failed to fetch metadata: {str(e)}"
-            logging.error(error_msg)
+                    logging.error(f"Error fetching metadata for {filename}: {e}")
+
+            self.after(0, self._finish_individual_fetch, successful_fetches, total_files, failed_extractions, failed_fetches)
+
+        except Exception as e:
+            error_msg = f"Unexpected error in metadata fetch: {str(e)}"
+            logging.critical(error_msg, exc_info=True)
             self.after(0, lambda: messagebox.showerror("Error", error_msg))
             self.after(0, self._hide_progress)
+    
+    def fetch_individual_threaded(self):
+        """Background thread for individual metadata fetching with intelligent caching"""
+        try:
+            total_files = len(self.cbz_paths)
+            self.individual_metadata_cache = {}
+            successful_fetches = 0
+            failed_extractions = []
+            failed_fetches = []
+            
+            # CACHE: Store results for titles we've already searched this session
+            title_search_cache = {}
+
+            for i, cbz_path in enumerate(self.cbz_paths):
+                filename = os.path.basename(cbz_path)
+                self.after(0, self._update_progress, i, total_files, filename)
+
+                # --- FIX IS HERE: Pass the full path (cbz_path), NOT just the filename ---
+                title = self._extract_title_from_filename(cbz_path)
+
+                if not title or len(title.strip()) < 2:
+                    failed_extractions.append(filename)
+                    continue
+
+                try:
+                    # Check cache first!
+                    if title in title_search_cache:
+                        metadata_options = title_search_cache[title]
+                    else:
+                        # LOCAL DUMP ONLY Search
+                        metadata_options = get_metadata_from_dump(title)
+                        
+                        if metadata_options:
+                            self._sort_metadata_options(metadata_options)
+                            
+                        title_search_cache[title] = metadata_options # Save to cache
+
+                    if metadata_options:
+                        self.individual_metadata_cache[cbz_path] = {
+                            'options': metadata_options,
+                            'title_used': title
+                        }
+                        
+                        # --- THE FIX: AUTO-APPLY THE #1 BEST MATCH ---
+                        best_match = metadata_options[0]
+                        current_metadata = self.file_metadata.get(cbz_path, {field: "" for field in self.fields})
+                        current_metadata.update(best_match)
+                        self.file_metadata[cbz_path] = current_metadata
+                        # ---------------------------------------------
+                        
+                        successful_fetches += 1
+                    else:
+                        failed_fetches.append(filename)
+
+                except Exception as e:
+                    failed_fetches.append(f"{filename} (error: {str(e)})")
+                    logging.error(f"Error fetching metadata for {filename}: {e}")
+
+            # Complete the process
+            self.after(0, self._finish_individual_fetch, successful_fetches, total_files, failed_extractions, failed_fetches)
+
         except Exception as e:
             error_msg = f"Unexpected error in metadata fetch: {str(e)}"
             logging.critical(error_msg, exc_info=True)
@@ -3995,350 +3323,357 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
         # Create detailed results message
         results = []
         if successful > 0:
-            results.append(f" Successfully fetched metadata for {successful}/{total} files")
+            results.append(f"✓ Successfully fetched metadata for {successful}/{total} files")
         
         if failed_extractions:
-            results.append(f"¡  Could not extract titles from {len(failed_extractions)} files:")
+            results.append(f"⚠ Could not extract titles from {len(failed_extractions)} files:")
             for filename in failed_extractions[:5]:  # Show first 5
-                results.append(f" {filename}")
+                results.append(f"  - {filename}")
             if len(failed_extractions) > 5:
                 results.append(f"  ... and {len(failed_extractions) - 5} more")
         
         if failed_fetches:
-            results.append(f"  No metadata found for {len(failed_fetches)} files:")
+            results.append(f"⚠ No metadata found for {len(failed_fetches)} files:")
             for filename in failed_fetches[:5]:  # Show first 5
-                results.append(f" {filename}")
+                results.append(f"  - {filename}")
             if len(failed_fetches) > 5:
                 results.append(f"  ... and {len(failed_fetches) - 5} more")
         
         if successful == 0:
-            results.append(" Tips for better results:")
-            results.append(" Make sure filenames contain the manga title")
-            results.append(" Try removing extra text like '[Group]' or quality tags")
-            results.append(" Use 'Same metadata for all files' if they're the same series")
+            results.append("\nTips for better results:")
+            results.append("- Make sure filenames contain the manga title")
+            results.append("- Try removing extra text like '[Group]' or quality tags")
+            results.append("- Use 'Batch Mode' if they're all the same series")
             
             messagebox.showinfo("No Results", "\n".join(results))
             return
 
+        # Update file listbox to show which files have metadata instantly
+        self._update_file_listbox_indicators()
+
         # Refresh current display
         if self.cbz_paths and self.current_index < len(self.cbz_paths):
             self.load_metadata(self.current_index)
-        
-        # Update file listbox to show which files have metadata
-        self._update_file_listbox_indicators()
+            self.populate_dropdown_for_current_file()            
         
         # Show results
-        print("Fetch Complete", "\n".join(results))
+        print("\n".join(results))
+        messagebox.showinfo("Fetch Complete", "\n".join(results))
 
     def _hide_progress(self):
         """Hide progress UI"""
         self.progress_frame.pack_forget()
 
-    def _extract_title_from_filename(self, filename):
-        """Extract title from filename - IMPROVED to handle numbers"""
-        import re
-        
-        # Remove file extension
-        name = filename.replace('.cbz', '').replace('.CBZ', '')
-        
-        # Pattern: capture everything before volume/chapter markers
-        # Now handles titles starting with numbers like "2.5 Dimensional Seduction"
-        patterns = [
-            r'^(.+?)\s+v(?:ol)?\.?\s*\d+',  # "Title v01" or "Title vol 1"
-            r'^(.+?)\s+volume\s+\d+',        # "Title Volume 1"
-            r'^(.+?)\s+ch(?:apter)?\.?\s*\d+', # "Title ch01"
-            r'^(.+?)\s+-\s+v\d+',            # "Title - v01"
-            r'^(.+?)\s+\(\d{4}\)',           # "Title (2022)"
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, name, re.IGNORECASE)
-            if match:
-                title = match.group(1).strip()
-                # Clean up trailing hyphens/dashes
-                title = re.sub(r'[\s\-]+$', '', title)
-                return title
-        
-        # Fallback: remove common suffixes
-        cleaned = re.sub(r'\s*\(.*?\)|\[.*?\]', '', name)  # Remove brackets
-        cleaned = re.sub(r'\s+(Digital|LuCaZ|1r0n|.*?Scan).*$', '', cleaned, flags=re.IGNORECASE)
-        
-        return cleaned.strip() if cleaned.strip() else None
+    def _extract_title_from_filename(self, file_path):
+        """Extract title from either the filename or the parent folder based on user preference"""
+        if getattr(self, 'use_folder_name_var', None) and self.use_folder_name_var.get():
+            # FOR FOLDERS: Extract the parent folder name
+            target_name = os.path.basename(os.path.dirname(file_path))
+            if not target_name: 
+                target_name = os.path.basename(file_path)
+                
+            cleaned = BRACKET_REMOVAL_PATTERN.sub('', target_name)
+            cleaned = SCANLATOR_REMOVAL_PATTERN.sub('', cleaned)
+            return cleaned.strip() if cleaned.strip() else target_name
+            
+        else:
+            # FOR FILES: Default behavior (extract from filename)
+            target_name = os.path.basename(file_path)
+            return auto_extract_title(target_name)
 
 
     def _update_file_listbox_indicators(self):
-        """Update file listbox to show which files have metadata"""
+        """Update file listbox to show which files have metadata while preserving folder names"""
         if not hasattr(self, 'file_listbox'):
             return
         
-        # Clear current items
         self.file_listbox.delete(0, tk.END)
         
-        # Re-populate with indicators
+        display_names = []
         for cbz_path in self.cbz_paths:
-            filename = os.path.basename(cbz_path)
-            # Add indicator if metadata was fetched individually
+            folder_name = os.path.basename(os.path.dirname(cbz_path))
+            file_name = os.path.basename(cbz_path)
+            
+            if folder_name:
+                display_name = f"{folder_name}/{file_name}"
+            else:
+                display_name = file_name
+                
             if cbz_path in self.individual_metadata_cache:
-                indicator = " "
+                indicator = "✓ "
             else:
                 indicator = ""
             
-            self.file_listbox.insert(tk.END, f"{indicator}{filename}")
+            display_names.append(f"{indicator}{display_name}")
+            
+        self.file_listbox.insert(tk.END, *display_names)
 
-    def fetch_anilist_metadata_gui(self):
-        """Fetch AniList metadata for ALL files based on current mode"""
+    def refresh_metadata_from_web_url(self):
+        """Fetch updated metadata from local dump based on Mangabaka ID in Web field for ALL loaded files"""
+        if not self.cbz_paths:
+            return
+            
+        # Group all loaded files by their embedded Mangabaka ID
+        files_by_id = {}
+        
+        for path in self.cbz_paths:
+            # Prioritize updated metadata web link, fallback to original
+            web_links = self.file_metadata.get(path, {}).get("Web", "")
+            if not web_links:
+                web_links = self.original_metadata.get(path, {}).get("Web", "")
+                
+            if web_links:
+                # Support both .org and .dev
+                match = re.search(r'mangabaka\.(?:org|dev)/(?:manga/)?(\d+)', web_links, re.IGNORECASE)
+                if match:
+                    entry_id = match.group(1)
+                    if entry_id not in files_by_id:
+                        files_by_id[entry_id] = []
+                    files_by_id[entry_id].append(path)
+        
+        if not files_by_id:
+            messagebox.showinfo("Error", "Could not find any valid Mangabaka URLs (.org or .dev) in the loaded files.")
+            return
+            
+        # Fetch and apply metadata for each unique ID found
+        total_updated = 0
+        failed_ids = []
+        
+        for entry_id, paths in files_by_id.items():
+            updated_meta = get_metadata_from_dump_by_id(entry_id)
+            
+            if not updated_meta:
+                failed_ids.append(entry_id)
+                continue
+                
+            # Apply the specific updated_meta to only the files that share this entry_id
+            for path in paths:
+                current_metadata = self.file_metadata.get(path, {field: "" for field in self.fields})
+                file_specific_fields = ["Title", "Number", "Volume", "PageCount"]
+                preserved_data = {f: current_metadata.get(f) for f in file_specific_fields if current_metadata.get(f)}
+                
+                current_metadata.update(updated_meta)
+                current_metadata.update(preserved_data)
+                self.file_metadata[path] = current_metadata
+                
+                # Keep dropdown options in sync
+                if path in self.individual_metadata_cache and self.individual_metadata_cache[path].get('options'):
+                    self.individual_metadata_cache[path]['options'][0] = updated_meta
+                    
+            total_updated += len(paths)
+            print(f"✅ Success: Refreshed metadata for {len(paths)} files using Web ID {entry_id}")
+            
+        # Refresh the UI for the currently selected file
+        self.load_metadata(self.current_index)
+        self.populate_dropdown_for_current_file()
+        
+        # Display a summary of the bulk operation
+        if failed_ids:
+            messagebox.showwarning(
+                "Refresh Partially Complete", 
+                f"Updated {total_updated} files across {len(files_by_id) - len(failed_ids)} series.\n\n"
+                f"Failed to find dump data for IDs: {', '.join(failed_ids)}"
+            )
+        else:
+            messagebox.showinfo(
+                "Refresh Complete", 
+                f"Successfully updated {total_updated} files across {len(files_by_id)} series based on their Web IDs."
+            )
+
+    def fetch_anilist_metadata_gui(self, on_complete=None):
+        """Fetch AniList metadata for ALL files based on current mode with smart API caching"""
         if not self.cbz_paths:
             messagebox.showerror("Error", "No CBZ files loaded")
             return
-        
+            
         mode = self.metadata_mode.get()
+        is_batch = mode == "batch"
         
-        if mode == "batch":
-            self.fetch_anilist_metadata_batch()
-        else:
-            self.fetch_anilist_metadata_individual_all()
-    
-    def fetch_anilist_metadata_batch(self):
-        """Fetch AniList metadata once and apply to ALL files (batch mode)"""
-        # In batch mode, all files should have the same metadata
-        # So we can use any file to get the AniList link
-        with self._cbz_paths_lock:
-            if not self.cbz_paths:
-                print("❌ Error: No CBZ files loaded")
+        # Display a summary of the bulk operation
+        if not is_batch:
+            if not messagebox.askyesno("Fetch AniList Metadata", 
+                                      f"This will fetch AniList metadata for all {len(self.cbz_paths)} files.\n"
+                                      f"Identical series will be cached to avoid duplicate API calls.\n\nContinue?"):
                 return
-            sample_file = self.cbz_paths[0]
-            cbz_paths_copy = self.cbz_paths.copy()
-        current_metadata = self.file_metadata.get(sample_file, {})
-        web_links = current_metadata.get('Web', '')
+                
+        print(f"\n{'='*60}\nMETADATA FETCH STARTING ({mode.upper()} MODE)\n{'='*60}")
         
-        if not web_links:
-            print("Error: No web links found in metadata. Please fetch Mangabaka metadata first.")
-            return
+        # Show progress UI
+        self.progress_frame.pack(fill='x', pady=(5, 0))
+        self.progress_bar.pack(fill='x')
+        self.progress_label.pack(anchor='w')
+        self.progress_bar['value'] = 0
+        self.progress_var.set("Starting AniList Fetch...")
         
-        # Extract AniList URL
-        anilist_url = None
-        for link in web_links.split(','):
-            link = link.strip()
-            if 'anilist.co' in link.lower():
-                anilist_url = link
-                break
-        
-        if not anilist_url:
-            print("Error: No AniList link found in web links. Make sure Mangabaka metadata includes an AniList link.")
-            return
-        
-        # Extract AniList ID
-        try:
-            anilist_id = extract_anilist_id_from_url(anilist_url)
-        except Exception as e:
-            print(f"Error: Could not extract AniList ID from URL '{anilist_url}': {str(e)}")
-            return
-        
-        if not anilist_id:
-            print(f"Error: Could not extract AniList ID from URL: {anilist_url}")
-            return
-        
-        try:
-            # Show progress
-            print(f"Fetching AniList metadata for ID: {anilist_id}...")
-            self.update_idletasks()
-            
-            # Fetch AniList metadata ONCE
-            anilist_metadata = fetch_anilist_metadata(anilist_id)
-            
-            if not anilist_metadata:
-                print(f"Error: Failed to fetch metadata from AniList for ID: {anilist_id}")
-                return
-            
-            # Apply the SAME AniList metadata to ALL files
-            files_updated = 0
-            for cbz_path in cbz_paths_copy:
-                if cbz_path in self.file_metadata:
-                    self.file_metadata[cbz_path].update(anilist_metadata)
-                    files_updated += 1
-            
-            # Refresh current display
-            self.load_metadata(self.current_index)
-            
-            # Log success message to console instead of popup
-            updated_fields = [field for field, value in anilist_metadata.items() if value]
-            print(f"Successfully applied AniList metadata to {files_updated} files!")
-            print(f"Updated fields: {', '.join(updated_fields)}")
-                              
-        except Exception as e:
-            logging.error(f"Error in fetch_anilist_metadata_batch: {e}")
-            print(f"Failed to fetch AniList metadata: {str(e)}")
+        # Start fetching in background thread to prevent UI freezing, passing on_complete
+        from threading import Thread
+        thread = Thread(target=self._fetch_anilist_threaded, args=(is_batch, on_complete), daemon=True)
+        thread.start()
 
-  
-    def fetch_anilist_metadata_individual_all(self):
-        """Fetch AniList metadata for each file individually (individual mode)"""
-        if not self.cbz_paths:
-            return
+
+    def _fetch_anilist_threaded(self, is_batch, on_complete=None):
+        """Background thread for AniList metadata fetching"""
+        files_updated, files_with_no_links, files_with_errors = 0, [], []
+        total_files = len(self.cbz_paths)
         
-        # Confirm with user since this will make multiple API calls
-        result = messagebox.askyesno("Fetch AniList Metadata", 
-                                    f"This will fetch AniList metadata for all {len(self.cbz_paths)} files.\n\n"
-                                    f"Each file may have different AniList links, so this will make separate API calls.\n\n"
-                                    f"Continue?")
-        if not result:
-            return
+        # CACHE: Store AniList API results by AniList ID to prevent duplicate network calls
+        anilist_api_cache = {}
+        cached_batch_metadata = None # Used to store metadata if in batch mode
         
-        try:
-            files_updated = 0
-            files_with_no_links = []
-            files_with_errors = []
+        for i, cbz_path in enumerate(self.cbz_paths):
+            filename = os.path.basename(cbz_path)
+            print(f"Processing [{i+1}/{total_files}]: {filename}")
             
-            print(f"\n{'='*60}")
-            print(f"ANILIST METADATA FETCH STARTING")
-            print(f"{'='*60}")
+            # Safely update the progress bar from the background thread
+            self.after(0, self._update_progress, i, total_files, filename)
             
-            # Process each file
-            for i, cbz_path in enumerate(self.cbz_paths):
-                filename = os.path.basename(cbz_path)
-                print(f"Processing [{i+1}/{len(self.cbz_paths)}]: {filename}")
+            # If in batch mode and we already fetched the metadata, just apply it
+            if is_batch and cached_batch_metadata:
+                self.file_metadata[cbz_path].update(cached_batch_metadata)
+                files_updated += 1
+                continue
                 
-                # Update progress (you might want to add a progress bar here)
-                self.update_idletasks()
+            current_metadata = self.file_metadata.get(cbz_path, {})
+            web_links = current_metadata.get('Web', '')
+            
+            if not web_links:
+                files_with_no_links.append(filename)
+                print("No web links found in metadata")
+                if is_batch: break # If batch mode fails on first file, abort
+                continue
                 
-                current_metadata = self.file_metadata.get(cbz_path, {})
-                web_links = current_metadata.get('Web', '')
+            try:
+                # Let extract_anilist_id_from_url handle the comma-splitting and finding
+                anilist_id = extract_anilist_id_from_url(web_links)
                 
-                if not web_links:
-                    files_with_no_links.append(filename)
-                    print(f"No web links found in metadata")
-                    continue
-                
-                # Extract AniList URL for this file
-                anilist_url = None
-                for link in web_links.split(','):
-                    link = link.strip()
-                    if 'anilist.co' in link.lower():
-                        anilist_url = link
-                        break
-                
-                if not anilist_url:
-                    files_with_no_links.append(filename)
-                    print(f"No AniList link found in web links")
-                    continue
-                
-                # Extract AniList ID
-                try:
-                    anilist_id = extract_anilist_id_from_url(anilist_url)
-                    if not anilist_id:
-                        files_with_errors.append(filename)
-                        print(f"Could not extract AniList ID from URL: {anilist_url}")
-                        continue
-                    
-                    # Validate ID is numeric
-                    if not str(anilist_id).isdigit():
-                        files_with_errors.append(filename)
-                        print(f"Invalid AniList ID format: '{anilist_id}' (must be numeric)")
-                        continue
-                        
-                except Exception as e:
-                    files_with_errors.append(filename)
-                    print(f"Error extracting AniList ID: {str(e)}")
-                    continue
-                
-                # Fetch AniList metadata for this file
-                try:
+                # Check cache first!
+                if anilist_id in anilist_api_cache:
+                    print(f"Loading AniList metadata for ID {anilist_id} from cache (Instant!)")
+                    anilist_metadata = anilist_api_cache[anilist_id]
+                else:
+                    print(f"Fetching AniList metadata for ID {anilist_id} from API...")
                     anilist_metadata = fetch_anilist_metadata(anilist_id)
-                    
                     if anilist_metadata:
-                        current_metadata.update(anilist_metadata)
-                        self.file_metadata[cbz_path] = current_metadata
-                        files_updated += 1
-                        print(f"Successfully fetched metadata (ID: {anilist_id})")
-                    else:
-                        files_with_errors.append(filename)
-                        print(f"AniList API returned no data for ID: {anilist_id}")
-                        
-                except Exception as e:
+                        anilist_api_cache[anilist_id] = anilist_metadata # Save to cache
+                
+                if anilist_metadata:
+                    current_metadata.update(anilist_metadata)
+                    self.file_metadata[cbz_path] = current_metadata
+                    files_updated += 1
+                    
+                    if is_batch:
+                        cached_batch_metadata = anilist_metadata # Save for rest of loop
+                else:
                     files_with_errors.append(filename)
-                    print(f"AniList API error: {str(e)}")
-            
-            # Print summary to console
-            print(f"\n{'='*60}")
-            print(f"ANILIST FETCH RESULTS SUMMARY")
-            print(f"{'='*60}")
-            print(f"Successfully updated: {files_updated}/{len(self.cbz_paths)} files")
-            
-            if files_with_no_links:
-                print(f"No AniList links: {len(files_with_no_links)} files")
-                for filename in files_with_no_links:
-                    print(f"{filename}")
-            
-            if files_with_errors:
-                print(f"Errors: {len(files_with_errors)} files")
-                for filename in files_with_errors:
-                    print(f"{filename}")
-            
-            if files_with_no_links or files_with_errors:
-                print(f"\nTROUBLESHOOTING TIPS:")
-                if files_with_no_links:
-                    print(f"Make sure to fetch Mangabaka metadata first")
-                    print(f"Check that the Mangabaka entries include AniList links")
-                if files_with_errors:
-                    print(f"Check that AniList URLs are properly formatted")
-                    print(f"Verify the AniList manga IDs are valid")
-                    print(f"Some entries might not have AniList pages")
-            
-            print(f"{'='*60}\n")
-            
-            # Refresh current display
-            self.load_metadata(self.current_index)
-            
-            # Show simple success message
-            if files_updated > 0:
-                print("AniList Fetch Complete", 
-                                  f"Successfully updated {files_updated}/{len(self.cbz_paths)} files!\n\n"
-                                  f"Check console for detailed results.")
-            else:
-                messagebox.showwarning("AniList Fetch Complete", 
-                                     f"No files were updated.\n\n"
-                                     f"Check console for detailed error information.")
-            
-        except Exception as e:
-            logging.error(f"Error in fetch_anilist_metadata_individual_all: {e}")
-            messagebox.showerror("Error", f"Failed to fetch AniList metadata: {str(e)}")
+                    print(f"AniList API returned no data for ID: {anilist_id}")
+                    if is_batch: break
+                    
+            except Exception as e:
+                files_with_errors.append(filename)
+                print(f"Error processing AniList data: {str(e)}")
+                if is_batch: break
+                
+        # Execute final UI updates on main thread and pass the callback forward
+        self.after(0, self._finish_anilist_fetch, is_batch, files_updated, total_files,
+                   len(anilist_api_cache), files_with_no_links, files_with_errors, on_complete)
 
+
+    def _finish_anilist_fetch(self, is_batch, files_updated, total_files,
+                              cache_size, files_with_no_links, files_with_errors, on_complete=None):
+        """Finish AniList fetch process and update UI"""
+        self._hide_progress()
+        
+        # Refresh UI
+        self.load_metadata(self.current_index)
+        
+        # Print Summary
+        print(f"\n{'='*60}\nANILIST FETCH RESULTS SUMMARY\n{'='*60}")
+        print(f"Successfully updated: {files_updated}/{total_files} files")
+        if not is_batch:
+            print(f"Unique API calls made: {cache_size}") # Shows you how many calls were saved!
+            
+        for lst, label in [(files_with_no_links, "No AniList links"), (files_with_errors, "Errors")]:
+            if lst:
+                print(f"{label}: {len(lst)} files")
+                for f in lst: print(f)
+                
+        if files_with_no_links or files_with_errors:
+            print("\nTROUBLESHOOTING TIPS:")
+            if files_with_no_links: print("- Fetch Mangabaka metadata first to get AniList links")
+            if files_with_errors: print("- Verify the AniList manga IDs/URLs are valid")
+        print(f"{'='*60}\n")
+        
+        # Show success message
+        if files_updated > 0:
+            print("AniList Fetch Complete", f"Successfully updated {files_updated}/{total_files} files!\nCheck console for details.")
+        else:
+            messagebox.showwarning("AniList Fetch Complete", "No files were updated.\nCheck console for detailed error information.")
+            
+        # Trigger the callback function if it was provided
+        if on_complete:
+            self.after(0, on_complete)
 
     def update_metadata_from_dropdown(self, *args):
-        """Updated method to handle both batch and individual modes"""
+        """Updated method to safely apply dropdown metadata across matching files"""
         selection_idx = self.dropdown.current()
         if selection_idx < 0 or selection_idx >= len(self.metadata_options):
             return
-    
+
         selected_metadata = self.metadata_options[selection_idx].copy()
-    
-        if self.cbz_paths and self.current_index < len(self.cbz_paths):
-            current_file = self.cbz_paths[self.current_index]
-            self.dropdown_selection_per_file[current_file] = selection_idx
-    
+        
+        if "Web" in selected_metadata:
+            selected_metadata["Web"] = self.clean_links(selected_metadata["Web"])
+
         mode = self.metadata_mode.get()
-    
+        
+        file_specific_fields = ["Title", "Number", "Volume", "PageCount"]
+
+        def apply_metadata_safely(path):
+            current_meta = self.file_metadata.get(path, {})
+            
+            preserved_data = {f: current_meta.get(f) for f in file_specific_fields if current_meta.get(f)}
+
+            new_meta = {field: "" for field in self.fields}
+            new_meta.update(current_meta)
+            new_meta.update(selected_metadata)
+            
+            new_meta.update(preserved_data)
+
+            if not new_meta.get("Volume"):
+                vol = extract_volume_from_filename(os.path.basename(path))
+                if vol:
+                    new_meta["Volume"] = vol
+                    
+            self.file_metadata[path] = new_meta
+
         if mode == "batch":
+            # BATCH MODE: Apply this exact metadata to EVERY loaded file
             with self._cbz_paths_lock:
-                cbz_paths_copy = self.cbz_paths.copy()
-            for cbz_path in cbz_paths_copy:
-                volume = extract_volume_from_filename(os.path.basename(cbz_path))
-                if volume:
-                    selected_metadata["Volume"] = volume
-                if "Web" in selected_metadata:
-                    selected_metadata["Web"] = self.clean_links(selected_metadata["Web"])
-                self.file_metadata[cbz_path].update(selected_metadata)
+                for cbz_path in self.cbz_paths:
+                    self.dropdown_selection_per_file[cbz_path] = selection_idx
+                    apply_metadata_safely(cbz_path)
         else:
+            # INDIVIDUAL MODE: Only apply to files that used this exact search term
             if self.cbz_paths and self.current_index < len(self.cbz_paths):
                 current_file = self.cbz_paths[self.current_index]
-                volume = extract_volume_from_filename(os.path.basename(current_file))
-                if volume:
-                    selected_metadata["Volume"] = volume
-                if "Web" in selected_metadata:
-                    selected_metadata["Web"] = self.clean_links(selected_metadata["Web"])
-                self.file_metadata[current_file].update(selected_metadata)
-    
-        self.load_metadata(self.current_index)
 
+                # Get the title we used to search for this specific file
+                cache_data = self.individual_metadata_cache.get(current_file, {})
+                title_used = cache_data.get('title_used')
+
+                # Find ALL files that used the exact same search title
+                files_to_update = [current_file]
+                if title_used:
+                    for path, data in self.individual_metadata_cache.items():
+                        if data.get('title_used') == title_used and path != current_file:
+                            files_to_update.append(path)
+
+                for path in files_to_update:
+                    self.dropdown_selection_per_file[path] = selection_idx
+                    apply_metadata_safely(path)
+
+        # Refresh the UI with the newly applied metadata
+        self.load_metadata(self.current_index)
         
     def insert_metadata(self):
         """Insert metadata into all CBZ files - parallel processing version"""
@@ -4348,653 +3683,389 @@ class MetadataGUI(tkdnd.Tk):  # Changed from tk.Tk to tkdnd.Tk for drag and drop
                 return
             total_files = len(self.cbz_paths)
         
-        # Get thread count (use saved preference or show dialog)
-        if not hasattr(self, '_saved_thread_count'):
-            thread_count = self._get_thread_count_from_user()
-            if thread_count is None:  # User cancelled
-                return
-            self._saved_thread_count = thread_count
-        else:
-            thread_count = self._saved_thread_count
-        
         # Only show confirmation dialog if not previously confirmed
-        if not hasattr(self, '_skip_confirmation') or not self._skip_confirmation:
-            result = messagebox.askyesno(
-                "Confirm Metadata Insertion", 
-                f"Insert metadata into {len(self.cbz_paths)} CBZ files?\n\n"
-                "This will modify the files and cannot be undone.\n\n"
-                f"Using {thread_count} parallel threads for processing.\n\n"
-                "(Right-click Insert Metadata into All CBZs button to change thread count)\n\n"
-                "Click Yes to proceed and skip this confirmation in the future."
-            )
-            if not result:
+        if not getattr(self, '_skip_confirmation', False):
+            if not messagebox.askyesno("Confirm Metadata Insertion", 
+                f"Insert metadata into {total_files} CBZ files?\n\nThis will modify the files and cannot be undone.\n\nClick Yes to proceed and skip this confirmation in the future."):
                 return
-            # Save the preference to skip future confirmations
             self._skip_confirmation = True
         
-        # Save current form data
         self.save_current_metadata()
-        
-        # Initialize parallel processing variables
         self._progress_lock = Lock()
         self._processed_count = 0
-        self._max_workers = thread_count
         
-        # Show progress UI
-        self._show_insertion_progress()
+        self._max_workers = MAX_WORKER_THREADS if MAX_WORKER_THREADS else min(8, (os.cpu_count() or 4) + 4)
         
-        # Start processing in background thread
-        thread = Thread(target=self._insert_metadata_threaded, daemon=True)
-        thread.start()
-    
-    def _show_insertion_progress(self):
-        """Show progress UI for metadata insertion"""
-        # Create progress frame if it doesn't exist
+        self._toggle_insertion_ui(active=True)
+        Thread(target=self._insert_metadata_threaded, daemon=True).start()
+
+    def _toggle_insertion_ui(self, active):
+        """Toggle UI state and progress frame visibility during insertion"""
+        state = 'disabled' if active else 'normal'
+        
+        # Toggle buttons and inputs
+        if not hasattr(self, '_insertion_buttons') and hasattr(self, 'button_frame'):
+            self._insertion_buttons = [w for w in self.button_frame.winfo_children() if isinstance(w, ttk.Button)]
+        for btn in getattr(self, '_insertion_buttons', []):
+            btn.configure(state=state)
+            
+        for widget in ('title_entry', 'file_listbox'):
+            if hasattr(self, widget):
+                getattr(self, widget).configure(state=state)
+                
+        if not active:
+            if hasattr(self, 'insertion_progress_frame'):
+                self.insertion_progress_frame.pack_forget()
+            for attr in ('_progress_lock', '_processed_count', '_max_workers'):
+                if hasattr(self, attr): delattr(self, attr)
+            return
+
+        # Create/Show progress UI
         if not hasattr(self, 'insertion_progress_frame'):
-            # Insert progress UI above the button frame
-            # Find the button frame's parent (main_frame) - since self IS the root window
-            button_frame_parent = self.button_frame.master if hasattr(self, 'button_frame') else self
+            parent = self.button_frame.master if hasattr(self, 'button_frame') else self
+            self.insertion_progress_frame = ttk.Frame(parent)
             
-            self.insertion_progress_frame = ttk.Frame(button_frame_parent)
-            
-            # Progress bar
-            self.insertion_progress_bar = ttk.Progressbar(
-                self.insertion_progress_frame, 
-                mode='determinate'
-            )
+            self.insertion_progress_bar = ttk.Progressbar(self.insertion_progress_frame, mode='determinate')
             self.insertion_progress_bar.pack(fill='x', pady=(0, 5))
             
-            # Status label
-            self.insertion_status_var = tk.StringVar(value="")
-            self.insertion_status_label = ttk.Label(
-                self.insertion_progress_frame, 
-                textvariable=self.insertion_status_var
-            )
-            self.insertion_status_label.pack(anchor='w')
+            self.insertion_status_var = tk.StringVar()
+            ttk.Label(self.insertion_progress_frame, textvariable=self.insertion_status_var).pack(anchor='w')
             
-            # Cancel button
             self.insertion_cancel_var = tk.BooleanVar(value=False)
-            cancel_btn = ttk.Button(
-                self.insertion_progress_frame,
-                text="Cancel Operation",
-                command=lambda: self.insertion_cancel_var.set(True)
-            )
-            cancel_btn.pack(anchor='center', pady=(5, 0))
-        
-        # Reset and show progress
+            ttk.Button(self.insertion_progress_frame, text="Cancel Operation", 
+                      command=lambda: self.insertion_cancel_var.set(True)).pack(anchor='center', pady=(5, 0))
+            
         self.insertion_progress_bar['value'] = 0
         self.insertion_status_var.set("Initializing parallel processing...")
         self.insertion_cancel_var.set(False)
-        
-        # Pack the progress frame above the buttons
-        self.insertion_progress_frame.pack(fill='x', pady=(5, 10), before=self.button_frame if hasattr(self, 'button_frame') else None)
-        
-        # Disable buttons during processing
-        self._disable_insertion_buttons()
-        
-    def _get_thread_count_from_user(self):
-        """Show dialog to get thread count from user"""
-        # Create dialog window
-        dialog = tk.Toplevel(self)
-        dialog.title("Thread Configuration")
-        dialog.geometry("600x600")
-        dialog.resizable(True, True)
-        dialog.transient(self)
-        dialog.grab_set()
-        
-        # Center the dialog
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
-        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
-        dialog.geometry(f"+{x}+{y}")
-        
-        # Variables
-        result = None
-        cpu_count = os.cpu_count() or 1
-        default_threads = min(32, cpu_count + 4)
-        
-        # Use saved preference if available
-        if hasattr(self, '_saved_thread_count'):
-            default_threads = self._saved_thread_count
-        
-        # Main frame
-        main_frame = ttk.Frame(dialog, padding="20")
-        main_frame.pack(fill='both', expand=True)
-        
-        # Title
-        title_label = ttk.Label(main_frame, text="Parallel Processing Configuration", 
-                               font=('TkDefaultFont', 12, 'bold'))
-        title_label.pack(pady=(0, 15))
-        
-        # Info section
-        info_frame = ttk.LabelFrame(main_frame, text="System Information", padding="10")
-        info_frame.pack(fill='x', pady=(0, 15))
-        
-        ttk.Label(info_frame, text=f"CPU Cores: {cpu_count}").pack(anchor='w')
-        ttk.Label(info_frame, text=f"Recommended: {min(32, cpu_count + 4)} threads").pack(anchor='w')
-        ttk.Label(info_frame, text="Range: 1-64 threads").pack(anchor='w')
-        
-        # Thread count selection
-        thread_frame = ttk.LabelFrame(main_frame, text="Thread Count", padding="10")
-        thread_frame.pack(fill='x', pady=(0, 15))
-        
-        # Scale widget
-        thread_var = tk.IntVar(value=default_threads)
-        
-        # Scale with proper configuration
-        scale_frame = ttk.Frame(thread_frame)
-        scale_frame.pack(fill='x', pady=(0, 10))
-        
-        thread_scale = ttk.Scale(scale_frame, from_=1, to=64, 
-                                orient='horizontal', variable=thread_var,
-                                length=350)
-        thread_scale.pack(side='top', fill='x')
-        
-        # Scale labels
-        label_frame = ttk.Frame(scale_frame)
-        label_frame.pack(fill='x', pady=(5, 0))
-        ttk.Label(label_frame, text="1", font=('TkDefaultFont', 8)).pack(side='left')
-        ttk.Label(label_frame, text="64", font=('TkDefaultFont', 8)).pack(side='right')
-        ttk.Label(label_frame, text="32", font=('TkDefaultFont', 8)).pack()
-        
-        # Current value display
-        value_label = ttk.Label(thread_frame, text=f"Selected: {default_threads} threads",
-                               font=('TkDefaultFont', 10, 'bold'))
-        value_label.pack(pady=(5, 0))
-        
-        # Update label when scale changes
-        def update_label(*args):
-            current_val = int(thread_var.get())
-            value_label.config(text=f"Selected: {current_val} threads")
-            # Update entry field
-            if entry_var.get() != str(current_val):
-                entry_var.set(str(current_val))
-        
-        thread_var.trace('w', update_label)
-        
-        # Entry for precise input
-        entry_frame = ttk.Frame(thread_frame)
-        entry_frame.pack(fill='x', pady=(10, 0))
-        
-        ttk.Label(entry_frame, text="Or enter exact value:").pack(side='left')
-        entry_var = tk.StringVar(value=str(default_threads))
-        thread_entry = ttk.Entry(entry_frame, width=10, textvariable=entry_var)
-        thread_entry.pack(side='right')
-        
-        # Sync entry with scale
-        def update_scale(*args):
-            try:
-                val = int(entry_var.get())
-                if 1 <= val <= 64 and val != thread_var.get():
-                    thread_var.set(val)
-            except ValueError:
-                pass
-        
-        entry_var.trace('w', update_scale)
-        
-        # Performance tips
-        tips_frame = ttk.LabelFrame(main_frame, text="Performance Tips", padding="10")
-        tips_frame.pack(fill='x', pady=(0, 15))
-        
-        tips_text = tk.Text(tips_frame, height=4, wrap='word', font=('TkDefaultFont', 8),
-                           relief='flat')
-        tips_text.pack(fill='x')
-        tips_text.insert('1.0', 
-            "More threads = faster processing for multiple files\n"
-            "Too many threads may cause system slowdown\n"
-            "For SSDs: 8-16 threads usually optimal\n"
-            "For HDDs: 2-4 threads recommended")
-        tips_text.config(state='disabled')
-        
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill='x', pady=(10, 0))
-        
-        def on_ok():
-            nonlocal result
-            try:
-                value = int(thread_var.get())
-                if 1 <= value <= 64:
-                    result = value
-                    dialog.destroy()
-                else:
-                    messagebox.showerror("Invalid Input", "Thread count must be between 1 and 64.",
-                                       parent=dialog)
-            except ValueError:
-                messagebox.showerror("Invalid Input", "Please enter a valid number.",
-                                   parent=dialog)
-        
-        def on_cancel():
-            dialog.destroy()
-        
-        def on_reset():
-            recommended = min(32, cpu_count + 4)
-            thread_var.set(recommended)
-            entry_var.set(str(recommended))
-        
-        # Button layout
-        ttk.Button(button_frame, text="Reset to Recommended", 
-                  command=on_reset).pack(side='left')
-        
-        right_buttons = ttk.Frame(button_frame)
-        right_buttons.pack(side='right')
-        
-        ttk.Button(right_buttons, text="Cancel", command=on_cancel).pack(side='right', padx=(5, 0))
-        ttk.Button(right_buttons, text="OK", command=on_ok, default='active').pack(side='right')
-        
-        # Handle window close
-        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
-        
-        # Key bindings
-        dialog.bind('<Return>', lambda e: on_ok())
-        dialog.bind('<Escape>', lambda e: on_cancel())
-        
-        # Focus on entry and select all
-        thread_entry.focus_set()
-        thread_entry.select_range(0, 'end')
-        
-        # Wait for dialog to close
-        dialog.wait_window()
-        
-        return result
-    
-    def _reset_thread_count(self):
-        """Reset saved thread count (utility method for right-click menu)"""
-        if hasattr(self, '_saved_thread_count'):
-            delattr(self, '_saved_thread_count')
-        
-        # Show new dialog
-        thread_count = self._get_thread_count_from_user()
-        if thread_count is not None:
-            self._saved_thread_count = thread_count
-            messagebox.showinfo("Thread Count Updated", 
-                               f"Thread count updated to {thread_count} threads for this session.")
-        
-        return thread_count
-    
-    def _hide_insertion_progress(self):
-        """Hide progress UI and clean up parallel processing variables"""
-        if hasattr(self, 'insertion_progress_frame'):
-            self.insertion_progress_frame.pack_forget()
-        
-        # Clean up parallel processing variables
-        if hasattr(self, '_progress_lock'):
-            del self._progress_lock
-        if hasattr(self, '_processed_count'):
-            del self._processed_count
-        if hasattr(self, '_max_workers'):
-            del self._max_workers
-        
-        # Re-enable buttons
-        self._enable_insertion_buttons()
-    
-    def _disable_insertion_buttons(self):
-        """Disable buttons during metadata insertion"""
-        # Store references to buttons for easy access
-        if not hasattr(self, '_insertion_buttons'):
-            self._insertion_buttons = []
-            
-            # Find all buttons in button_frame
-            if hasattr(self, 'button_frame'):
-                for child in self.button_frame.winfo_children():
-                    if isinstance(child, ttk.Button):
-                        self._insertion_buttons.append(child)
-        
-        # Disable all buttons
-        for btn in self._insertion_buttons:
-            btn.configure(state='disabled')
-        
-        # Also disable other important UI elements
-        if hasattr(self, 'title_entry'):
-            self.title_entry.configure(state='disabled')
-        if hasattr(self, 'file_listbox'):
-            self.file_listbox.configure(state='disabled')
-    
-    def _enable_insertion_buttons(self):
-        """Re-enable buttons after metadata insertion"""
-        # Re-enable all buttons
-        if hasattr(self, '_insertion_buttons'):
-            for btn in self._insertion_buttons:
-                btn.configure(state='normal')
-        
-        # Re-enable other UI elements
-        if hasattr(self, 'title_entry'):
-            self.title_entry.configure(state='normal')
-        if hasattr(self, 'file_listbox'):
-            self.file_listbox.configure(state='normal')
-    
+        self.insertion_progress_frame.pack(fill='x', pady=(5, 10), before=getattr(self, 'button_frame', None))
+
     def _insert_metadata_threaded(self):
-        """Background thread for metadata insertion - now with parallel processing"""
+        """Background thread for parallel metadata insertion"""
         try:
-            total_files = len(self.cbz_paths)
-            success_count = 0
-            error_files = []
+            total = len(self.cbz_paths)
+            success_count, error_files = 0, []
             
-            # Pre-process all metadata to avoid repeated lookups
+            # Prepare metadata mapping
             processed_metadata = {}
-            for cbz_path in self.cbz_paths:
-                raw_metadata = self.file_metadata.get(cbz_path, {field: "" for field in self.fields})
-                metadata = {}
-                
+            for path in self.cbz_paths:
+                raw = self.file_metadata.get(path, {})
+                meta = {}
                 for field in self.fields:
-                    if field in raw_metadata and raw_metadata[field]:
-                        if field == "Web":
-                            # Handle Web field specially - convert line breaks to comma-separated
-                            content = raw_metadata[field]
-                            if isinstance(content, str) and '\n' in content:
-                                urls = [url.strip() for url in content.split() if url.strip()]
-                                metadata[field] = ', '.join(urls)
-                            else:
-                                metadata[field] = content
-                        else:
-                            metadata[field] = raw_metadata[field]
+                    val = raw.get(field)
+                    if not val: continue
+                    if field == "Web" and isinstance(val, str) and '\n' in val:
+                        meta[field] = ', '.join(u.strip() for u in val.split() if u.strip())
+                    else:
+                        meta[field] = val
+                processed_metadata[path] = meta
                 
-                processed_metadata[cbz_path] = metadata
-            
-            # Use ThreadPoolExecutor for parallel processing
             with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
-                # Submit all tasks
-                future_to_path = {
-                    executor.submit(self._process_single_cbz_file, cbz_path, processed_metadata[cbz_path]): cbz_path 
-                    for cbz_path in self.cbz_paths
-                }
+                future_to_path = {executor.submit(self._process_single_cbz_file, p, processed_metadata[p]): p for p in self.cbz_paths}
                 
-                # Process completed tasks as they finish
                 for future in as_completed(future_to_path):
-                    # Check for cancellation
-                    if hasattr(self, 'insertion_cancel_var') and self.insertion_cancel_var.get():
-                        # Cancel remaining tasks
-                        for remaining_future in future_to_path:
-                            remaining_future.cancel()
-                        executor.shutdown(wait=False)
-                        self.after(0, self._handle_insertion_cancelled, success_count, error_files)
+                    if getattr(self, 'insertion_cancel_var', None) and self.insertion_cancel_var.get():
+                        [f.cancel() for f in future_to_path]
+                        self.after(0, self._finish_insertion, "cancelled", success_count, total, error_files)
                         return
-                    
-                    cbz_path = future_to_path[future]
-                    filename = os.path.basename(cbz_path)
-                    
-                    # Update progress counter thread-safely
+                        
+                    filename = os.path.basename(future_to_path[future])
                     with self._progress_lock:
                         self._processed_count += 1
-                        current_count = self._processed_count
-                    
-                    # Update progress on main thread
-                    self.after(0, self._update_insertion_progress, current_count - 1, total_files, filename)
+                        current = self._processed_count
+                        
+                    self.after(0, self._update_insertion_progress, current - 1, total, filename)
                     
                     try:
-                        result = future.result()
-                        if result is True:
-                            success_count += 1
-                        else:
-                            error_files.append(f"{filename}: {result}")
+                        res = future.result()
+                        if res is True: success_count += 1
+                        else: error_files.append(f"{filename}: {res}")
                     except Exception as e:
-                        error_msg = str(e)
-                        error_files.append(f"{filename}: {error_msg}")
-                        logging.error(f"Failed to process {cbz_path}: {e}")
-            
-            # Finished successfully
-            self.after(0, self._finish_insertion, success_count, total_files, error_files)
+                        error_files.append(f"{filename}: {e}")
+                        
+            self.after(0, self._finish_insertion, "success", success_count, total, error_files)
             
         except Exception as e:
-            # Handle unexpected errors
-            error_msg = f"Unexpected error during metadata insertion: {str(e)}"
-            logging.error(error_msg)
-            self.after(0, lambda: self._handle_insertion_error(error_msg, 0))
-    
+            self.after(0, self._finish_insertion, "error", 0, 0, [], str(e))
+
     def _process_single_cbz_file(self, cbz_path, metadata):
         """Process a single CBZ file (called by thread pool)"""
         try:
-            # Auto-fill page count if not already set
             if not metadata.get('PageCount'):
-                try:
-                    page_count = count_pages_in_cbz(cbz_path)
-                    metadata['PageCount'] = str(page_count)
-                except Exception as e:
-                    logging.warning(f"Could not count pages in {os.path.basename(cbz_path)}: {e}")
-                    # Continue without page count
+                try: metadata['PageCount'] = str(count_pages_in_cbz(cbz_path))
+                except Exception as e: logging.warning(f"Could not count pages in {os.path.basename(cbz_path)}: {e}")
             
-            # Create and insert XML
-            xml_data = create_comicinfo_xml(metadata)
-            insert_comicinfo_into_cbz(cbz_path, xml_data)
+            insert_comicinfo_into_cbz(cbz_path, create_comicinfo_xml(metadata))
             return True
-            
         except Exception as e:
             return str(e)
-    
+
     def _update_insertion_progress(self, current, total, filename):
-        """Update progress bar and status (called on main thread)"""
+        """Update progress bar and status"""
         if hasattr(self, 'insertion_progress_bar'):
-            progress = (current / total) * 100
-            self.insertion_progress_bar['value'] = progress
-            
+            self.insertion_progress_bar['value'] = (current / total) * 100
         if hasattr(self, 'insertion_status_var'):
-            # Truncate long filenames for display
-            display_name = filename
-            if len(display_name) > 50:
-                display_name = display_name[:47] + "..."
-            
-            # Show parallel processing status with user-selected thread count
-            remaining = total - current
-            self.insertion_status_var.set(
-                f"Processing: {display_name} ({current + 1}/{total}) "
-                f"[{remaining} remaining, using {getattr(self, '_max_workers', 1)} threads]"
-            )
-        
-        # Force UI update
+            name = filename[:47] + "..." if len(filename) > 50 else filename
+            self.insertion_status_var.set(f"Processing: {name} ({current + 1}/{total}) [{total - current} remaining, using {getattr(self, '_max_workers', 1)} threads]")
         self.update_idletasks()
-    
-    def _finish_insertion(self, success_count, total_files, error_files):
-        """Handle successful completion (called on main thread)"""
-        self._hide_insertion_progress()
+
+    def _finish_insertion(self, status, success, total, errors=None, error_msg=None):
+        """Handle all completion states (success, cancelled, error)"""
+        self._toggle_insertion_ui(active=False)
+        errors = errors or []
         
-        # Show results
-        if error_files:
-            if len(error_files) > 10:  # Limit error display for readability
-                shown_errors = error_files[:10]
-                error_display = "\n".join(shown_errors) + f"\n... and {len(error_files) - 10} more errors"
+        if status == "cancelled":
+            messagebox.showinfo("Operation Cancelled", f"Operation cancelled by user.\n\nSuccessfully processed {success} files before cancellation.")
+        elif status == "error":
+            messagebox.showerror("Critical Error", f"Critical error occurred:\n{error_msg}\n\nSuccessfully processed {success} files before error.")
+        elif errors:
+            if len(errors) > 5:
+                self._show_detailed_results(success, total, errors)
             else:
-                error_display = "\n".join(error_files)
-            
-            # Create scrollable error dialog for many errors
-            if len(error_files) > 5:
-                self._show_detailed_results(success_count, total_files, error_files)
-            else:
-                error_msg = (f"Processed {success_count}/{total_files} files successfully.\n\n"
-                            f"Errors in {len(error_files)} files:\n{error_display}")
-                messagebox.showwarning("Partial Success", error_msg)
+                msg = f"Processed {success}/{total} files successfully.\n\nErrors in {len(errors)} files:\n" + "\n".join(errors)
+                messagebox.showwarning("Partial Success", msg)
         else:
-            print("Success", 
-                               f"Successfully inserted metadata into all {success_count} CBZ files "
-                               f"using {getattr(self, '_max_workers', 1)} parallel threads!")
-    
-    def _handle_insertion_cancelled(self, success_count, error_files):
-        """Handle user cancellation (called on main thread)"""
-        self._hide_insertion_progress()
-        messagebox.showinfo("Operation Cancelled", 
-                           f"Operation cancelled by user.\n\n"
-                           f"Successfully processed {success_count} files before cancellation.")
-    
-    def _handle_insertion_error(self, error_msg, success_count):
-        """Handle critical error (called on main thread)"""
-        self._hide_insertion_progress()
-        messagebox.showerror("Critical Error", 
-                            f"Critical error occurred:\n{error_msg}\n\n"
-                            f"Successfully processed {success_count} files before error.")
-    
-    def _show_detailed_results(self, success_count, total_files, error_files):
+            print("Success", f"Successfully inserted metadata into all {success} CBZ files using {getattr(self, '_max_workers', 1)} parallel threads!")
+            
+    def _show_detailed_results(self, success, total, errors):
         """Show detailed results in a scrollable window"""
-        result_window = tk.Toplevel(self)
-        result_window.title("Metadata Insertion Results")
-        result_window.transient(self)
-        result_window.grab_set()
+        win = tk.Toplevel(self)
+        win.title("Metadata Insertion Results")
+        win.transient(self)
+        win.grab_set()
         
-        # Summary
-        summary_text = f"Processed {success_count}/{total_files} files successfully"
-        if error_files:
-            summary_text += f"{len(error_files)} errors"
+        ttk.Label(win, text=f"Processed {success}/{total} files successfully | {len(errors)} errors", font=('TkDefaultFont', 10, 'bold')).pack(pady=10)
         
-        ttk.Label(result_window, text=summary_text, font=('TkDefaultFont', 10, 'bold')).pack(pady=10)
+        frame = ttk.Frame(win)
+        frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
         
-        if error_files:
-            ttk.Label(result_window, text="Files with errors:").pack(anchor='w', padx=10)
-            
-            # Scrollable text widget for errors
-            text_frame = ttk.Frame(result_window)
-            text_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
-            
-            text_widget = tk.Text(text_frame, wrap='word', height=15)
-            scrollbar = ttk.Scrollbar(text_frame, orient='vertical', command=text_widget.yview)
-            text_widget.configure(yscrollcommand=scrollbar.set)
-            
-            text_widget.pack(side='left', fill='both', expand=True)
-            scrollbar.pack(side='right', fill='y')
-            
-            # Insert error details
-            for error in error_files:
-                text_widget.insert('end', f" {error}\n")
-            
-            text_widget.configure(state='disabled')  # Make read-only
+        txt = tk.Text(frame, wrap='word', height=15)
+        sb = ttk.Scrollbar(frame, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
         
-        # Close button
-        ttk.Button(result_window, text="Close", 
-                  command=result_window.destroy).pack(pady=10)
+        txt.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
         
-        # Center the dialog LAST
-        result_window.geometry("600x400")
-        result_window.update_idletasks()
-        center_window(result_window, 600, 400)
+        for err in errors: txt.insert('end', f" {err}\n")
+        txt.configure(state='disabled')
+        
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
+        win.geometry("600x400")
+        win.update_idletasks()
+        center_window(win, 600, 400)
                 
-    def next_file(self):
-        """Navigate to next file"""
+    def navigate_file(self, direction):
+        """Navigate files by offset (+1 for next, -1 for previous)"""
         if not self.cbz_paths:
             return
             
         self.save_current_metadata()
-        self.current_index = (self.current_index + 1) % len(self.cbz_paths)
+        self.current_index = (self.current_index + direction) % len(self.cbz_paths)
         self.load_metadata(self.current_index)
         self.populate_dropdown_for_current_file()
         
-        # Update listbox selection
         self.file_listbox.select_clear(0, tk.END)
         self.file_listbox.select_set(self.current_index)
         self.file_listbox.see(self.current_index)
 
-    def prev_file(self):
-        """Navigate to previous file"""
+    def fill_metadata_field(self, field_type, on_complete=None):
+        """Generic function to auto-fill volume, chapter, or page count for all files"""
         if not self.cbz_paths:
             return
             
-        self.save_current_metadata()
-        self.current_index = (self.current_index - 1) % len(self.cbz_paths)
-        self.load_metadata(self.current_index)
-        self.populate_dropdown_for_current_file()
-        
-        # Update listbox selection
-        self.file_listbox.select_clear(0, tk.END)
-        self.file_listbox.select_set(self.current_index)
-        self.file_listbox.see(self.current_index)
-
-    def fill_volume_info(self):
-        """Auto-fill volume information for all files - FIXED VERSION"""
-        if not self.cbz_paths:
-            return
+        # STEP 1: If it's page counting, spin up the background thread
+        if field_type == "pages":
+            self.progress_frame.pack(fill='x', pady=(5, 0))
+            self.progress_bar['value'] = 0
+            self.progress_var.set("Counting pages...")
             
-        updated_count = 0
-        for cbz_path in self.cbz_paths:
-            volume = extract_volume_from_filename(os.path.basename(cbz_path))
-            if volume:
-                # Ensure the file has metadata dict
-                if cbz_path not in self.file_metadata:
-                    self.file_metadata[cbz_path] = {field: "" for field in self.fields}
-                
-                self.file_metadata[cbz_path]["Volume"] = volume
-                updated_count += 1
-        
-        # FIXED: Refresh current display AND update file indicators
-        self.load_metadata(self.current_index)
-        
-        # Update file listbox indicators if in individual mode  
-        if hasattr(self, '_update_file_listbox_indicators'):
-            self._update_file_listbox_indicators()
-        
-        if updated_count > 0:
-            print("Volume Info", f"Updated volume information for {updated_count} files")
-        else:
-            print("Volume Info", "No volume information could be extracted from filenames")
-
-
-
-    def fill_chapter_info(self):
-        """Auto-fill chapter/issue number information for all files"""
-        if not self.cbz_paths:
+            from threading import Thread
+            Thread(target=self._threaded_page_counter, args=(on_complete,), daemon=True).start()
             return
-            
-        updated_count = 0
-        for cbz_path in self.cbz_paths:
-            chapter = extract_chapter_from_filename(os.path.basename(cbz_path))
-            if chapter:
-                # Ensure the file has metadata dict
-                if cbz_path not in self.file_metadata:
-                    self.file_metadata[cbz_path] = {field: "" for field in self.fields}
-                
-                self.file_metadata[cbz_path]["Number"] = chapter
-                updated_count += 1
-        
-        # Refresh current display AND update file indicators
-        self.load_metadata(self.current_index)
-        
-        # Update file listbox indicators if in individual mode  
-        if hasattr(self, '_update_file_listbox_indicators'):
-            self._update_file_listbox_indicators()
-        
-        if updated_count > 0:
-            print("Chapter Info", f"Updated chapter/issue numbers for {updated_count} files")
-        else:
-            print("Chapter Info", "No chapter/issue numbers could be extracted from filenames")
 
-    def fill_page_count(self):
-        """Count and fill page count for all files"""
-        if not self.cbz_paths:
-            return
-            
+        # STEP 2: For volume and chapter, regex is practically instant so we run it on the main thread
         updated_count = 0
         failed_files = []
         
         for cbz_path in self.cbz_paths:
+            filename = os.path.basename(cbz_path)
+            value = None
+            
             try:
-                page_count = count_pages_in_cbz(cbz_path)
-                if page_count > 0:
-                    # Ensure the file has metadata dict
+                if field_type == "volume":
+                    value = extract_volume_from_filename(filename)
+                    field_name = "Volume"
+                elif field_type == "chapter":
+                    value = extract_chapter_from_filename(filename)
+                    field_name = "Number"
+                
+                if value is not None:
                     if cbz_path not in self.file_metadata:
-                        self.file_metadata[cbz_path] = {field: "" for field in self.fields}
+                        self.file_metadata[cbz_path] = {f: "" for f in self.fields}
                     
-                    self.file_metadata[cbz_path]["PageCount"] = str(page_count)
+                    self.file_metadata[cbz_path][field_name] = value
                     updated_count += 1
+            
             except Exception as e:
-                filename = os.path.basename(cbz_path)
                 failed_files.append(filename)
-                logging.error(f"Failed to count pages for {cbz_path}: {e}")
+                logging.error(f"Failed to process {field_type} for {cbz_path}: {e}")
         
-        # FIXED: Refresh current display AND update file indicators
+        # Refresh UI
         self.load_metadata(self.current_index)
-        
-        # Update file listbox indicators if in individual mode
         if hasattr(self, '_update_file_listbox_indicators'):
             self._update_file_listbox_indicators()
+            
+        # Logging
+        labels = {
+            "volume": ("Volume Info", "volume information"),
+            "chapter": ("Chapter Info", "chapter/issue numbers")
+        }
+        title, noun = labels[field_type]
         
-        # Show results
+        if updated_count > 0:
+            print(f"[{title}] Successfully updated {noun} for {updated_count} files!")
+        else:
+            print(f"[{title}] No {noun} could be extracted/counted for any files")
+            
+        # Trigger the callback immediately since regex was instant
+        if on_complete:
+            self.after(0, on_complete)
+
+
+    def _threaded_page_counter(self, on_complete=None):
+        """Background thread to count pages in CBZ files without freezing UI"""
+        updated_count = 0
+        failed_files = []
+        total_files = len(self.cbz_paths)
+        
+        for i, cbz_path in enumerate(self.cbz_paths):
+            filename = os.path.basename(cbz_path)
+            
+            # Safely update progress bar from thread (uses your existing update_progress method)
+            self.after(0, self._update_progress, i, total_files, filename)
+            
+            try:
+                value = count_pages_in_cbz(cbz_path)
+                if value is not None and value > 0:
+                    value = str(value)
+                else:
+                    value = None
+                    
+                if value is not None:
+                    if cbz_path not in self.file_metadata:
+                        self.file_metadata[cbz_path] = {f: "" for f in self.fields}
+                    
+                    self.file_metadata[cbz_path]["PageCount"] = value
+                    updated_count += 1
+            except Exception as e:
+                failed_files.append(filename)
+                logging.error(f"Failed to process pages for {cbz_path}: {e}")
+                
+        # Send everything back to the main thread to update UI safely
+        self.after(0, self._finish_page_counter, updated_count, failed_files, on_complete)
+        
+    def _finish_page_counter(self, updated_count, failed_files, on_complete=None):
+        """Finish page count process and update UI on main thread"""
+        self._hide_progress()
+        self.load_metadata(self.current_index)
+        
+        if hasattr(self, '_update_file_listbox_indicators'):
+            self._update_file_listbox_indicators()
+            
         if updated_count > 0:
             if failed_files:
-                messagebox.showinfo("Page Count", 
-                    f"Updated page count for {updated_count}/{len(self.cbz_paths)} files.\n\n"
-                    f"Failed to process {len(failed_files)} files:\n" + 
-                    "\n".join(failed_files[:5]) + 
-                    (f"\n... and {len(failed_files) - 5} more" if len(failed_files) > 5 else ""))
+                msg = (f"Updated page count for {updated_count}/{len(self.cbz_paths)} files.\n\n"
+                       f"Failed to process {len(failed_files)} files:\n" + 
+                       "\n".join(failed_files[:5]))
+                if len(failed_files) > 5:
+                    msg += f"\n... and {len(failed_files) - 5} more"
+                messagebox.showinfo("Page Count", msg)
             else:
-                print("Page Count", f"Successfully updated page count for all {updated_count} files!")
+                print(f"[Page Count] Successfully counted pages for {updated_count} files!")
         else:
-            print("Page Count", "Could not count pages for any files")
+            print(f"[Page Count] No pages could be counted for any files")
+            
+        # FINALLY: Trigger the callback function so save_current_series executes!
+        if on_complete:
+            self.after(0, on_complete)        
 
+    def fill_title_from_filename(self):
+        if not self.cbz_paths:
+            return
+
+        count = 0
+        files_to_process = self.cbz_paths
+
+        for cbz_path in files_to_process:
+            filename = os.path.basename(cbz_path)
+            name_no_ext = os.path.splitext(filename)[0]
+
+            # Use the global pattern INSIDE the loop
+            vol_match = TITLE_FALLBACK_PATTERN.search(name_no_ext)
+
+            if vol_match:
+                extracted_title = name_no_ext[:vol_match.end()].strip()
+            else:
+                extracted_title = name_no_ext.strip()
+
+            if extracted_title:
+                if cbz_path not in self.file_metadata:
+                    self.file_metadata[cbz_path] = {}
+                self.file_metadata[cbz_path]["Title"] = extracted_title
+                count += 1
+
+        if self.cbz_paths:
+            self.load_metadata(self.current_index)
+
+        print(f"Updated titles for {count} files based on filename patterns.")
+
+    def _toggle_folder_name_mode(self):
+        """React instantly when the user toggles the 'Use Folder Name' checkbox."""
+        if not hasattr(self, 'cbz_paths') or not self.cbz_paths:
+            return
+            
+        # Clear the cache so it stops holding onto old filename extractions
+        if hasattr(self, 'individual_metadata_cache'):
+            self.individual_metadata_cache.clear()
+            
+        # Instantly update the Title text box for the currently selected file
+        if self.current_index < len(self.cbz_paths):
+            current_path = self.cbz_paths[self.current_index]
+            new_title = self._extract_title_from_filename(current_path)
+            if new_title:
+                self.title_var.set(new_title)
+                
+            # Reload metadata to refresh the UI and clear stale dropdowns
+            self.load_metadata(self.current_index)
+            
+    def do_all_operations(self):
+        """Execute all metadata operations in sequence via callbacks"""
+        try:
+            # Step 1: Start AniList fetch. When done, it will call _continue_do_all
+            self.fetch_anilist_metadata_gui(on_complete=self._continue_do_all)
+        except Exception as e:
+            print(f"Error during Do All operation: {e}")
+
+    def _continue_do_all(self):
+        try:
+            # Step 2: Run the fast synchronous tasks
+            self.fill_metadata_field("volume")
+            self.fill_metadata_field("chapter")
+            self.fill_title_from_filename()
+            
+            # Step 3: Start Page counting. When done, trigger the save!
+            self.fill_metadata_field("pages", on_complete=self.save_current_series)
+            
+        except Exception as e:
+            print(f"Error during Do All continuation: {e}")
+            
+    def do_all_operations_alt(self):
+        """Execute all metadata operations in sequence (No AniList)"""
+        try:
+            # Skip Anilist and jump straight to the synchronous fields & page count
+            self._continue_do_all()
+        except Exception as e:
+            print(f"Error during Do All Alt operation: {e}")
 
 if __name__ == '__main__':
     try:
