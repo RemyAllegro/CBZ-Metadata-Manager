@@ -39,8 +39,13 @@ from threading import Thread, Lock
 # Set to None to let Python auto-calculate based on your CPU.
 MAX_WORKER_THREADS = None 
 
-# Web domains to filter out of the "Web" links field
-WEB_LINK_BLACKLIST = ['amazon.co.jp', 'ja.wikipedia.org']
+WEB_LINK_BLACKLIST = ['amazon.co.jp', 'ja.wikipedia.org', 'pocket.shonenmagazine.com', 'noeve-grafx.com', 's.accessbooks.jp', 'animate-onlineshop.jp', 'bookpass.auone.jp', 'product.kyobobook.co.kr', 'ebookjapan.yahoo.co.jp', 'booksmart.jp', 'comipo.app', 'galapagosstore.com', 'dbook.docomo.ne.jp', 'comic.k-manga.jp', 'mechacomic.jp', 'books.rakuten.co.jp', 'honto.jp', 'renta.papy.co.jp', 'mangazenkan.com', 'nadeshiko-shoten.jp', 'yamadashoten.com', 'tower.jp', 'video.unext.jp', 'mechacomi.jp', 'maruzenjunkudo.co.jp', 'kinokuniya.co.jp', 'comic.iowl.jp', 'honyaclub.com', 'sp.handycomic.jp', 'galcomi.jp', 'animatebookstore.com', 'ebookstore.sony.jp', 'rakurakucomic.com', 'happycomic.jp', 'paburi.com', 'sokuyomi.jp', 'coicomi.com', 'j-pop.it', 'comic-days.com', 'x.com']
+
+# Allowed 'type' and 'language' values for Mangabaka's Weblinks API
+# Allowed Type Inputs = retailer, publisher, webplatform, info, social, news, other
+ALLOWED_WEBLINK_TYPES = {"retailer", "publisher", "webplatform", "info"}
+ALLOWED_WEBLINK_LANGUAGES = {"en", "fr", "zh", "ja", "ko"}
+# --------------------------------------
 
 # Allowed languages for the LocalizedSeries field
 ALLOWED_LOCALIZED_LANGUAGES = {"en", "zh", "ja", "ko", "zh-Latn", "ko-Latn", "ja-Latn", "fr", "mr"}
@@ -73,12 +78,11 @@ ANILIST_CHARACTER_ROLES = ['MAIN', 'SUPPORTING', 'BACKGROUND']
 ANILIST_STAFF_ROLE_MAPPINGS = {
     'story': 'Writer', 'story & art': 'Writer', 'original creator': 'Writer',
     'original story': 'Writer', 'author': 'Writer', 'writer': 'Writer',
-    'artist': 'Penciller', 'illustrator': 'Penciller',
+    'artist': 'CoverArtist', 'illustrator': 'CoverArtist', 
     'inking': 'Inker', 'color': 'Colorist', 'coloring': 'Colorist',
     'lettering (english)': 'Letterer', 'touch-up art & lettering (english)': 'Letterer',
-    'cover': 'CoverArtist', 'cover art': 'CoverArtist',
-    'assistant': 'CoverArtist', 'assistant (former)': 'CoverArtist', 'assistant (Former)': 'CoverArtist',
-    'editor': 'Editor', 'editorial': 'Editor',
+    'editor': 'Editor', 'editorial': 'Editor', 
+    'assistant': 'Penciller', 'assistant (former)': 'Penciller', 'assistant (Former)': 'Penciller', 
     'translation': 'Translator', 'translator (english)': 'Translator'
 }
 
@@ -92,13 +96,12 @@ ANILIST_ART_ROLES = ['character design', 'art', 'story & art']
 
 # The exact ComicInfo.xml fields supported by the GUI (Order matters for UI layout)
 METADATA_FIELDS = [
-    "Title", "Series", "LocalizedSeries", "AgeRating", "Number", "Count", "Volume", 
-    "PageCount", "Summary", "Year", "Month", "Day", "Writer", "Penciller", "Inker", 
-    "Colorist", "Letterer", "CoverArtist", "Editor", "Translator", "Publisher", 
-    "Imprint", "GTIN", "Genre", "Tags", "LanguageISO", "Web", "Notes", "Format", "Characters", 
-    "CommunityRating", "Review", "AlternateSeries", "AlternateNumber", "AlternateCount", 
-    "Teams", "Locations", "ScanInformation", "StoryArc", "StoryArcNumber", "SeriesGroup", 
-    "MainCharacterOrTeam"
+    "Title", "Series", "LocalizedSeries", "AgeRating", "Number", "Count", "Volume",
+    "PageCount", "Summary", "Year", "Month", "Day", "Writer", "Penciller", "Inker", "Colorist", 
+    "Letterer", "CoverArtist", "Editor", "Translator", "Publisher", "Imprint", "GTIN", "Genre", 
+    "Tags", "LanguageISO", "Web", "Notes", "Format", "Characters", "CommunityRating", "Review", 
+    "AlternateSeries", "AlternateNumber", "AlternateCount", "Teams", "Locations", "ScanInformation", 
+    "StoryArc", "StoryArcNumber", "SeriesGroup", "MainCharacterOrTeam"
 ]
 
 # UI Tooltips for the metadata fields
@@ -136,6 +139,9 @@ FORMAT_OPTIONS = [
     "Trade Paper Back", "Omnibus", "Compendium", "Absolute", "Graphic Novel", 
     "GN", "FCBD"
 ]
+
+# Folders containing any of these keywords will prefer 'total_chapters' over 'final_volume' for Manhwa/Manhua/OEL
+WEBCOMIC_COUNT_KEYWORDS = ["manhwa", "pornhwa", "manhua", "webcomic", "webtoon"]
 
 # ==============================================================================
 # PATTERNS
@@ -536,30 +542,57 @@ class SeriesDatabase:
     def get_all_series_with_aliases(self):
         """Get all series with their aliases for matching"""
         cursor = self.conn.cursor()
-
+        
         try:
-            cursor.execute('''
-                SELECT sm.series_name, sm.updated_at, 
-                       GROUP_CONCAT(sa.alias, '|') as aliases
+            cursor.execute("""
+                SELECT sm.series_name, sm.updated_at, GROUP_CONCAT(sa.alias, '|') as aliases
                 FROM series_metadata sm
                 LEFT JOIN series_aliases sa ON sm.series_name = sa.series_name
                 GROUP BY sm.series_name, sm.updated_at
                 ORDER BY sm.updated_at DESC
-            ''')
-
+            """)
+            
             results = []
             for row in cursor.fetchall():
                 series_name = row[0]
                 updated_at = row[1]
                 aliases = row[2].split('|') if row[2] else []
                 results.append((series_name, updated_at, aliases))
-
             return results
-
         except Exception as e:
-            logging.error(f"Error getting series with aliases: {e}")
+            logging.error(f"Error getting all series with aliases: {e}")
             return []
 
+    def search_series_with_aliases(self, search_term):
+        if not search_term or not search_term.strip():
+            return self.get_all_series_with_aliases()
+            
+        search_pattern = f"%{search_term.strip()}%"
+        cursor = self.conn.cursor()
+        
+        try:
+            # Matches search term against series name OR any of its aliases
+            cursor.execute("""
+                SELECT sm.series_name, sm.updated_at, GROUP_CONCAT(sa.alias, '|') as aliases
+                FROM series_metadata sm
+                LEFT JOIN series_aliases sa ON sm.series_name = sa.series_name
+                WHERE sm.series_name LIKE ? OR sm.series_name IN (
+                    SELECT series_name FROM series_aliases WHERE alias LIKE ?
+                )
+                GROUP BY sm.series_name, sm.updated_at
+                ORDER BY sm.updated_at DESC
+            """, (search_pattern, search_pattern))
+            
+            results = []
+            for row in cursor.fetchall():
+                series_name = row[0]
+                updated_at = row[1]
+                aliases = row[2].split('|') if row[2] else []
+                results.append((series_name, updated_at, aliases))
+            return results
+        except Exception as e:
+            logging.error(f"Error searching series with aliases: {e}")
+            return []
 
 # ==============================================================================
 # ALIAS EDITOR DIALOG
@@ -1217,7 +1250,7 @@ def parse_anilist_data(media_data):
                 is_touchup = 'touch-up' in role.lower()
                 
                 if is_art_role and not is_touchup_lettering and not is_touchup:
-                    for art_field in ['Penciller', 'Inker', 'Colorist']:
+                    for art_field in ['CoverArtist']: # Changed from Artist (CoverArtist)
                         staff_roles[art_field].append(staff_name)
                 
                 # Apply global regex mappings first
@@ -1446,36 +1479,7 @@ class SeriesManagerDialog(tk.Toplevel):
                 safe_name = str(series_data[0]) if len(series_data) > 0 else "Error"
                 self.tree.insert('', 'end', values=(safe_name, "Error", "Error"))
 
-    def search_series_with_aliases(self, search_term):
-        if not search_term or not search_term.strip():
-            return self.get_all_series_with_aliases()
-            
-        search_pattern = f"%{search_term.strip()}%"
-        cursor = self.conn.cursor()
-        
-        try:
-            # Matches search term against series name OR any of its aliases
-            cursor.execute("""
-                SELECT sm.series_name, sm.updated_at, GROUP_CONCAT(sa.alias, '|') as aliases
-                FROM series_metadata sm
-                LEFT JOIN series_aliases sa ON sm.series_name = sa.series_name
-                WHERE sm.series_name LIKE ? OR sm.series_name IN (
-                    SELECT series_name FROM series_aliases WHERE alias LIKE ?
-                )
-                GROUP BY sm.series_name, sm.updated_at
-                ORDER BY sm.updated_at DESC
-            """, (search_pattern, search_pattern))
-            
-            results = []
-            for row in cursor.fetchall():
-                series_name = row[0]
-                updated_at = row[1]
-                aliases = row[2].split('|') if row[2] else []
-                results.append((series_name, updated_at, aliases))
-            return results
-        except Exception as e:
-            logging.error(f"Error searching series with aliases: {e}")
-            return []
+
 
     def on_search(self, event=None):
         search_term = self.search_var.get().strip()
@@ -2734,16 +2738,39 @@ class MetadataGUI(tkdnd.Tk):
         def safe_get(obj, key, default=""):
             return str(obj.get(key, default)) if obj.get(key) is not None else default
 
-        # Handle links from both 'links' and 'source' fields
-        links = entry.get("links", [])
-        if isinstance(links, str):
-            links = [links]
-        elif not isinstance(links, list):
-            links = []
-
-        links = [link for link in links if link]
+        # Handle links from new paginated Weblinks API or local dumps
+        extracted_links = []
         
-        # NEW: Process 'source' field to extract additional links
+        # 1. Construct and append the Mangabaka direct link
+        # Extract the main entry ID to build the MB link
+        entry_id = entry.get("id")
+        if entry_id:
+            mb_url = f"https://mangabaka.org/{str(entry_id).strip()}"
+            extracted_links.append(mb_url)
+            
+        # Extract from either the local dump key
+        links_v2 = entry.get("links_v2")
+        
+        items_to_process = []
+        
+        # 1. Handle local dump format (list of objects directly under 'links_v2')
+        if isinstance(links_v2, list):
+            items_to_process = links_v2
+            
+        # Parse the collected items
+        for item in items_to_process:
+            if not isinstance(item, dict):
+                continue
+            
+            l_type = item.get("type", "")
+            l_lang = item.get("language", "unknown")
+            l_url = item.get("url", "")
+            
+            if l_type in ALLOWED_WEBLINK_TYPES and l_lang in ALLOWED_WEBLINK_LANGUAGES:
+                if l_url:
+                    extracted_links.append(l_url)
+
+        # 2. Extract legacy source-derived links (AniList, MangaUpdates, etc.)
         source = entry.get("source", {})
         if isinstance(source, dict):
             # Use constants for URL patterns
@@ -2765,9 +2792,10 @@ class MetadataGUI(tkdnd.Tk):
                     if is_valid_source_id(source_id, source_name):
                         source_id_str = str(source_id).strip().strip('"')
                         constructed_url = f"{base_url}{source_id_str}"
-                        links.append(constructed_url)
+                        extracted_links.append(constructed_url)
         
-        web_links = MetadataGUI.clean_links('; '.join(links))
+        # Clean URLs and join them into a semi-colon separated string
+        web_links = MetadataGUI.clean_links('; '.join(extracted_links))
 
         # NEW PUBLISHER LOGIC - Use global PREFERRED_PUBLISHER_TYPES
         publishers = entry.get("publishers", [])
@@ -2891,9 +2919,7 @@ class MetadataGUI(tkdnd.Tk):
             "Volume": "",
             "Summary": MetadataGUI.clean_html_description(safe_get(entry, "description")),
             "Writer": ", ".join(safe_list(entry.get("authors", []))),
-            "Penciller": ", ".join(safe_list(entry.get("artists", []))),
-            "Inker": ", ".join(safe_list(entry.get("artists", []))),
-            "Colorist": ", ".join(safe_list(entry.get("artists", []))),
+            "CoverArtist": ", ".join(safe_list(entry.get("artists", []))),
             "Publisher": pub_text,
             "Imprint": imprint_text,
             "GTIN": "",
@@ -2905,6 +2931,8 @@ class MetadataGUI(tkdnd.Tk):
             "LanguageISO": safe_get(entry, "lang", "en"),
             "Web": web_links,
             "Count": (safe_get(entry, "final_volume") or safe_get(entry, "total_chapters")) if safe_get(entry, "status").lower() in ["completed", "canceled", "cancelled"] else "",
+            "_total_chapters": safe_get(entry, "total_chapters") if safe_get(entry, "status").lower() in ["completed", "canceled", "cancelled"] else "",
+            "_final_volume": safe_get(entry, "final_volume") if safe_get(entry, "status").lower() in ["completed", "canceled", "cancelled"] else "",
             "PageCount": "",
             "Teams": "",
             "Locations": "",
@@ -3454,10 +3482,35 @@ class MetadataGUI(tkdnd.Tk):
                 
                 current_metadata.update(updated_meta)
                 current_metadata.update(preserved_data)
+
+                # --- NEW: Dynamic Count Logic ---
+                series_type = current_metadata.get("type", "").upper()
+                
+                if series_type in ["MANHWA", "MANHUA", "OEL"]:
+                    path_lower = path.lower()
+                    is_webcomic_path = any(kw.lower() in path_lower for kw in WEBCOMIC_COUNT_KEYWORDS)
+                    
+                    if is_webcomic_path:
+                        # Prefer total_chapters, fallback to final_volume
+                        current_metadata["Count"] = current_metadata.get("_total_chapters") or current_metadata.get("_final_volume") or ""
+                    else:
+                        # Prefer final_volume, fallback to total_chapters
+                        current_metadata["Count"] = current_metadata.get("_final_volume") or current_metadata.get("_total_chapters") or ""
+                else:
+                    # Default Manga logic (Always prefer physical volume count first)
+                    current_metadata["Count"] = current_metadata.get("_final_volume") or current_metadata.get("_total_chapters") or ""
+
+                # Remove temporary helper keys so they don't cause clutter
+                current_metadata.pop("_total_chapters", None)
+                current_metadata.pop("_final_volume", None)
+                # --------------------------------
+
                 self.file_metadata[path] = current_metadata
                 
                 # Keep dropdown options in sync
                 if path in self.individual_metadata_cache and self.individual_metadata_cache[path].get('options'):
+                    # We pass the raw updated_meta (which still holds the hidden keys) 
+                    # so the dropdown logic can re-evaluate if needed
                     self.individual_metadata_cache[path]['options'][0] = updated_meta
                     
             total_updated += len(paths)
@@ -3638,6 +3691,28 @@ class MetadataGUI(tkdnd.Tk):
             new_meta.update(selected_metadata)
             
             new_meta.update(preserved_data)
+
+            # --- NEW: Dynamic Count Logic ---
+            series_type = new_meta.get("type", "").upper()
+            
+            if series_type in ["MANHWA", "MANHUA", "OEL"]:
+                path_lower = path.lower()
+                is_webcomic_path = any(kw.lower() in path_lower for kw in WEBCOMIC_COUNT_KEYWORDS)
+                
+                if is_webcomic_path:
+                    # Prefer total_chapters, fallback to final_volume
+                    new_meta["Count"] = new_meta.get("_total_chapters") or new_meta.get("_final_volume") or ""
+                else:
+                    # Prefer final_volume, fallback to total_chapters
+                    new_meta["Count"] = new_meta.get("_final_volume") or new_meta.get("_total_chapters") or ""
+            else:
+                # Default Manga logic (Always prefer physical volume count first)
+                new_meta["Count"] = new_meta.get("_final_volume") or new_meta.get("_total_chapters") or ""
+
+            # Remove temporary helper keys so they don't cause clutter
+            new_meta.pop("_total_chapters", None)
+            new_meta.pop("_final_volume", None)
+            # --------------------------------
 
             if not new_meta.get("Volume"):
                 vol = extract_volume_from_filename(os.path.basename(path))
