@@ -170,7 +170,9 @@ APOSTROPHE_MAP = str.maketrans({
 
 # Pre-compiled Regex and Function Patterns
 VOLUME_PATTERN = re.compile(r'v(?:ol)?\.?\s*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)', re.IGNORECASE)
+SEASON_PATTERN = re.compile(r's(?:eason)?\.?\s*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)', re.IGNORECASE)
 CHAPTER_PATTERN = re.compile(r'\bc(?:h(?:ap(?:ter)?)?)?\.?\s*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)', re.IGNORECASE)
+EPISODE_PATTERN = re.compile(r'\be(?:p(?:isode)?)?\.?\s*(\d+(?:\.\d+)*(?:-\d+(?:\.\d+)*)?)', re.IGNORECASE)
 HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
 WHITESPACE_PATTERN = re.compile(r'\s+')
 NEWLINE_CLEANUP_PATTERN = re.compile(r'\n\s*\n\s*\n+')
@@ -1010,7 +1012,7 @@ def insert_comicinfo_into_cbz(cbz_path, xml_data):
         raise
 
 def extract_volume_from_filename(filename):
-    for pattern in [VOLUME_PATTERN, VOLUME_START_PATTERN, STANDALONE_V_PATTERN, REVERSED_VOLUME_PATTERN]:
+    for pattern in [VOLUME_PATTERN, VOLUME_START_PATTERN, STANDALONE_V_PATTERN, REVERSED_VOLUME_PATTERN, SEASON_PATTERN]:
         match = pattern.search(filename)
         if match:
             return match.group(1)
@@ -1018,8 +1020,11 @@ def extract_volume_from_filename(filename):
 
 
 def extract_chapter_from_filename(filename):
-    match = CHAPTER_PATTERN.search(filename)
-    return match.group(1) if match else None
+    for pattern in [CHAPTER_PATTERN, EPISODE_PATTERN]:
+        match = pattern.search(filename)
+        if match:
+            return match.group(1)
+    return None
 
 def extract_anilist_id_from_url(url):
     """Dramatically simplified, bulletproof regex extraction"""
@@ -2900,8 +2905,11 @@ class MetadataGUI(tkdnd.Tk):
             basename_no_ext = os.path.splitext(basename)[0]
 
             chapter_match = CHAPTER_PATTERN.search(basename_no_ext)
+            episode_match = EPISODE_PATTERN.search(basename_no_ext)
             if chapter_match:
                 chapter_number = chapter_match.group(1)
+            elif episode_match:
+                chapter_number = episode_match.group(1)
 
             filename_title = EXTENSION_PATTERN.sub('', basename)
             filename_title = CHAPTER_PATTERN.sub('', filename_title)
