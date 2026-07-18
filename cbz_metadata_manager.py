@@ -189,20 +189,16 @@ EXTENSION_PATTERN = re.compile(r'\.(cbz|cbr|zip|rar|pdf)$', re.IGNORECASE)
 TITLE_FALLBACK_PATTERN = re.compile(r'\b(?:v|vol|volume)\.?\s*-?\s*\d+(?:\.\d+)?', re.IGNORECASE)
 ANILIST_URL_PATTERN = re.compile(r'anilist\.co/manga/(\d+)')
 TITLE_CLEANUP_PATTERNS = [
-    re.compile(r'^(.*?)\s*v?ol?\.?\s*\d+(?:\.\d+)?', re.IGNORECASE),     # V01, Vol01, Vol. 1, Vol 1.5, Vol 1.25
-    re.compile(r'^(.*?)\s*volume\.?\s*\d+(?:\.\d+)?', re.IGNORECASE),    # Volume 1, Volume 1.5
-    re.compile(r'^(.*?)\s*ch?apter?\.?\s*\d+(?:\.\d+)?', re.IGNORECASE), # ch01, chapter 1, ch98.5, ch92.17
-    re.compile(r'^(.*?)\s*v\.?\s*\d+', re.IGNORECASE),                   # v01
+    re.compile(r'^(.*?)\s*v(?:ol)?(?:ume)?\.?\s*\d+(?:\.\d+)?', re.IGNORECASE),     # V01, Vol01, Vol. 1, Vol 1.5, Vol 1.25, Volume 1, Volume 1.5
+    re.compile(r'^(.*?)\s*ch?(?:ap)?(?:ter)?\.?\s*\d+(?:\.\d+)?', re.IGNORECASE), # C1, ch01, chapter 1, ch98.5, ch92.17
     # NEW: Handle combined Season/Side Story + Chapter with multi-decimal support (S01 C07.5, SS C15.17)
     re.compile(r'^(.*?)\s+(?:S\d+|SS\d*)\s+C\d+(?:\.\d+)?', re.IGNORECASE),
     # NEW: Handle standalone Season or Side Story markers (S01, SS, SS2)
     re.compile(r'^(.*?)\s+(?:S\d+|SS\d*)(?:\s|$|\-)', re.IGNORECASE),
-    # NEW: Handle standalone Chapter markers WITH multi-decimal support (C001, C07.5, C92.17)
-    re.compile(r'^(.*?)\s+C\d+(?:\.\d+)?', re.IGNORECASE),
     re.compile(r'^(.*?)\s*\d{4}', re.IGNORECASE),                        # year fallback
 ]
 TRAILING_HYPHEN_PATTERN = re.compile(r'[\s\-]+$')
-BRACKET_REMOVAL_PATTERN = re.compile(r'\s*\(.*?\)|\[.*?\]')
+BRACKET_REMOVAL_PATTERN = re.compile(r'\s*\(.*?\)|\s*\[.*?\]')
 SCANLATOR_REMOVAL_PATTERN = re.compile(r'\s+(Digital|LuCaZ|1r0n|.*?Scan).*$', re.IGNORECASE)
 SPECIAL_CHARS_REMOVAL = re.compile(r'[^\w\s]')
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.avif', '.jxl', '.gif', '.bmp'}
