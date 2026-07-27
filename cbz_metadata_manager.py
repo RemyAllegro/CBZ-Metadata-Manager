@@ -197,6 +197,13 @@ TITLE_CLEANUP_PATTERNS = [
     re.compile(r'^(.*?)\s+(?:S\d+|SS\d*)(?:\s|$|\-)', re.IGNORECASE),
     re.compile(r'^(.*?)\s*\d{4}', re.IGNORECASE),                        # year fallback
 ]
+POST_TITLE_EXTRACT_PATTERNS = [
+    re.compile(r'v(?:ol)?(?:ume)?\.?\s*\d+(?:\.\d+)?\s*(.*$)',re.IGNORECASE), #V01, Vol01, Vol. 1
+    re.compile(r's(?:eas)?(?:on)?\.?\s*\d+(?:\.\d+)?\s*(.*$)',re.IGNORECASE),
+    re.compile(r'ch?(?:ap)?(?:ter)?\.?\s*\d+(?:\.\d+)?\s*(.*$)',re.IGNORECASE),
+    re.compile(r'ep?(?:is)?(?:ode)?\.?\s*\d+(?:\.\d+)?\s*(.*$)',re.IGNORECASE),
+    re.compile(r'^\s*\W*\s*(.*$)') #strip any extranious leading punctuation (ie :;-)
+]
 TRAILING_HYPHEN_PATTERN = re.compile(r'[\s\-]+$')
 BRACKET_REMOVAL_PATTERN = re.compile(r'\s*\(.*?\)|\s*\[.*?\]')
 SCANLATOR_REMOVAL_PATTERN = re.compile(r'\s+(Digital|LuCaZ|1r0n|.*?Scan).*$', re.IGNORECASE)
@@ -1583,6 +1590,7 @@ class MetadataGUI(tkdnd.Tk):
         self.title_var = tk.StringVar()
         self.dropdown_selection_per_file = {}
         self.bulk_edit_enabled = tk.BooleanVar(value=False)
+        self.post_title_extract = tk.BooleanVar(value=False)
         self.use_folder_name_var = tk.BooleanVar(value=False)
 
         self.cbz_paths = []
@@ -1858,6 +1866,10 @@ class MetadataGUI(tkdnd.Tk):
         extract_title_btn.pack(side='left', padx=(0, 5))
         ToolTip(extract_title_btn, "Extract Chapter/Volume Name from filename (text after Cxxx/Vxxx)")
         
+        post_title_check = ttk.Checkbutton(nav_frame, text="Title after Volume/Chapter", variable=self.post_title_extract)
+        post_title_check.pack(side='left', padx=(0,5))
+        ToolTip(post_title_check, "Extract Title Name from filename (text after Cxxx/Vxxx)")
+
         do_all_alt_btn = ttk.Button(nav_frame, text="Do All - Fetch Anilist", command=self.do_all_operations_alt)
         do_all_alt_btn.pack(side='right', padx=(5, 0))
         ToolTip(do_all_alt_btn, "Execute all operations: Auto-fill Volume/Chapter, Count Pages, Extract Title and Save")
@@ -4078,20 +4090,33 @@ class MetadataGUI(tkdnd.Tk):
         for cbz_path in files_to_process:
             filename = os.path.basename(cbz_path)
             name_no_ext = os.path.splitext(filename)[0]
-
-            # Use the global pattern INSIDE the loop
-            vol_match = TITLE_FALLBACK_PATTERN.search(name_no_ext)
-
-            if vol_match:
-                extracted_title = name_no_ext[:vol_match.end()].strip()
-            else:
+            
+            if self.post_title_extract.get():
                 extracted_title = name_no_ext.strip()
+                for pattern in POST_TITLE_EXTRACT_PATTERNS:
+                    match = pattern.search(extracted_title)
+                    if match:
+                        extracted_title = match.group(1)
+                if extracted_title:
+                    if cbz_path not in self.file_metadata:
+                        self.file_metadata[cbz_path] = {}
+                    self.file_metadata[cbz_path]["Title"] = extracted_title
+                    count += 1
+                    
+            else:
+                # Use the global pattern INSIDE the loop
+                vol_match = TITLE_FALLBACK_PATTERN.search(name_no_ext)
 
-            if extracted_title:
-                if cbz_path not in self.file_metadata:
-                    self.file_metadata[cbz_path] = {}
-                self.file_metadata[cbz_path]["Title"] = extracted_title
-                count += 1
+                if vol_match:
+                    extracted_title = name_no_ext[:vol_match.end()].strip()
+                else:
+                    extracted_title = name_no_ext.strip()
+
+                if extracted_title:
+                    if cbz_path not in self.file_metadata:
+                        self.file_metadata[cbz_path] = {}
+                    self.file_metadata[cbz_path]["Title"] = extracted_title
+                    count += 1
 
         if self.cbz_paths:
             self.load_metadata(self.current_index)
