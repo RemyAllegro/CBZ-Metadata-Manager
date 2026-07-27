@@ -4092,7 +4092,8 @@ class MetadataGUI(tkdnd.Tk):
             name_no_ext = os.path.splitext(filename)[0]
             
             if self.post_title_extract.get():
-                extracted_title = name_no_ext.strip()
+                cleaned = BRACKET_REMOVAL_PATTERN.sub('', name_no_ext)
+                extracted_title = SCANLATOR_REMOVAL_PATTERN.sub('', cleaned)
                 for pattern in POST_TITLE_EXTRACT_PATTERNS:
                     match = pattern.search(extracted_title)
                     if match:

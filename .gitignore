@@ -1,2 +1,4 @@
 cbz_metadata.log
 series.db
+series.db-shm
+series.db-wal
