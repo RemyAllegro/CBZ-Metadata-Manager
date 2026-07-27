@@ -1864,11 +1864,11 @@ class MetadataGUI(tkdnd.Tk):
         
         extract_title_btn = ttk.Button(nav_frame, text="Extract Title", command=self.fill_title_from_filename)
         extract_title_btn.pack(side='left', padx=(0, 5))
-        ToolTip(extract_title_btn, "Extract Chapter/Volume Name from filename (text after Cxxx/Vxxx)")
+        ToolTip(extract_title_btn, "Extract Chapter/Volume Name from filename (text before Cxxx/Vxxx)")
         
         post_title_check = ttk.Checkbutton(nav_frame, text="Title after Volume/Chapter", variable=self.post_title_extract)
         post_title_check.pack(side='left', padx=(0,5))
-        ToolTip(post_title_check, "Extract Title Name from filename (text after Cxxx/Vxxx)")
+        ToolTip(post_title_check, "When enabled, Extract Title to get text after Vxxx/Cxxx")
 
         do_all_alt_btn = ttk.Button(nav_frame, text="Do All - Fetch Anilist", command=self.do_all_operations_alt)
         do_all_alt_btn.pack(side='right', padx=(5, 0))
